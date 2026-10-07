@@ -210,6 +210,10 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
         elems = 1;
         bytes = 1;
         return true;
+    case 39:   // MXFP4: one E8M0 scale + 16 bytes of 4-bit codes per 32 values (MiMo-V2.6-Flash experts)
+        elems = 32;
+        bytes = 17;
+        return true;
     case 42:
         elems = 64;
         bytes = 18;
