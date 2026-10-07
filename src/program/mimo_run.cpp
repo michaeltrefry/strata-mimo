@@ -38,6 +38,8 @@ int main(int argc, char** argv) {
         else if (a == "--ctx") cfg.max_ctx = std::atoi(argv[i + 1]);
         else if (a == "--window") window = std::atoi(argv[i + 1]);
         else if (a == "--dump") cfg.dump_dir = argv[i + 1];
+        else if (a == "--cpu-experts") cfg.cpu_experts = std::atoi(argv[i + 1]) != 0;
+        else if (a == "--ram-copy") cfg.ram_copy = std::atoi(argv[i + 1]) != 0;
         else {
             std::fprintf(stderr, "unknown option %s\n", a.c_str());
             return 2;
@@ -100,9 +102,10 @@ int main(int argc, char** argv) {
             const double gs = std::chrono::duration<double>(clk::now() - t0).count();
             const DecoderStats& st = dec.stats();
             const double uses = (double) (st.expert_uses - before.expert_uses);
-            std::printf("generated %d tokens in %.2f s (%.2f tok/s); resident hit rate %.1f%%, %.1f experts staged per token\n",
+            std::printf("generated %d tokens in %.2f s (%.2f tok/s); resident hit rate %.1f%%, %.1f experts staged per "
+                        "token, CPU experts %.2f ms per token\n",
                         generate, gs, generate / gs, 100.0 * (st.expert_hits - before.expert_hits) / uses,
-                        (double) (st.staged - before.staged) / generate);
+                        (double) (st.staged - before.staged) / generate, (st.cpu_ms - before.cpu_ms) / generate);
             std::printf("tokens:");
             for (int32_t t : out) std::printf(" %d", t);
             std::printf("\n");

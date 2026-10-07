@@ -1,6 +1,8 @@
 #include "strata/mimo/decoder.hpp"
 
+#include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/mimo/cpu_experts.hpp"
 #include "strata/mimo/expert_mxfp4.hpp"
 #include "strata/mimo/ops.hpp"
 #include "strata/mimo/router.hpp"
@@ -8,12 +10,15 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <map>
 #include <numeric>
 
 namespace strata::mimo {
+namespace cpu = strata::kernels::cpu;
 namespace {
 constexpr int kMaxT = 8;
 constexpr size_t kMiB = 1u << 20;
@@ -60,6 +65,12 @@ MimoDecoder::~MimoDecoder() {
     attn_scratch_free(attn_scratch_);
     for (void* p : allocs_) cudaFree(p);
     if (pinned_) cudaFreeHost(pinned_);
+    cpu_.reset();
+    pool_.reset();
+    for (void* p : ram_) std::free(p);
+    for (void* p : {(void*) h_host_, (void*) wt_host_, (void*) cpu_out_host_, (void*) ids_host_})
+        if (p) cudaFreeHost(p);
+    if (prev_affinity_ >= 0) cpu::restore_thread_affinity(prev_affinity_);
     if (stream_) cudaStreamDestroy(stream_);
 }
 
@@ -98,8 +109,28 @@ bool MimoDecoder::init(std::string& err) {
     if (!attn_scratch_alloc(attn_scratch_, 0, err)) return false;
     if (!cuda_ok(cudaMallocHost(&pinned_, kMxSlotBytes), "pinned staging", err)) return false;
 
-    // staging slots: one per (token, expert) a window can route
-    n_staging_ = kMaxT * g.n_expert_used;
+    // v1: the CPU computes the non-resident experts, from a RAM copy of every MoE layer
+    if (cfg_.cpu_experts) {
+        pool_ = std::make_unique<cpu::ExpertPool>(0, true, true);   // one worker per physical core but the first
+        const cpu::CpuTopology topo = cpu::detect_cpu_topology(true);
+        if (topo.host_core >= 0) prev_affinity_ = cpu::pin_current_thread(topo.host_core);   // the host works in the pool
+        cpu_ = std::make_unique<CpuExperts>(model_, *pool_);
+        if (cfg_.ram_copy)
+            for (int l = 0; l < g.n_layer; ++l) {
+                if (!g.is_moe(l)) continue;
+                void* p = std::malloc(cpu_->layer_bytes(l));
+                if (!p) { err = "out of RAM for the experts' copy (layer " + std::to_string(l) + ")"; return false; }
+                ram_.push_back(p);
+                cpu_->copy_layer(l, (uint8_t*) p, 16);
+            }
+        const size_t act = (size_t) kMaxT * E * 4, small = (size_t) kMaxT * kRouterMaxUsed * 4;
+        if (!cuda_ok(cudaMallocHost(&h_host_, act), "pinned", err) || !cuda_ok(cudaMallocHost(&cpu_out_host_, act), "pinned", err) ||
+            !cuda_ok(cudaMallocHost(&wt_host_, small), "pinned", err) || !cuda_ok(cudaMallocHost(&ids_host_, small), "pinned", err) ||
+            !dev(act, &cpu_out_))
+            return false;
+    }
+    // staging slots (v0): one per (token, expert) a window can route
+    n_staging_ = cfg_.cpu_experts ? 0 : kMaxT * g.n_expert_used;
     // resident slots: the profile's best experts, as many as the budget holds
     size_t free_b = 0, total_b = 0;
     cudaMemGetInfo(&free_b, &total_b);
@@ -200,6 +231,33 @@ bool MimoDecoder::forward(const int32_t* tokens, int T, int pos0, int32_t* next,
             router_topk(router_logits_, (const float*) w.exp_probs_b.data, ids_, wt_, T, g.n_expert, K,
                         g.expert_weights_scale, s);
             dump("ffn_moe_topk", l, ids_, (size_t) K * 4, T, true);
+            if (cfg_.cpu_experts) {   // v1: GPU hits and CPU misses at the same time
+                cudaMemcpyAsync(ids_host_, ids_, sizeof(int32_t) * T * K, cudaMemcpyDeviceToHost, s);
+                cudaMemcpyAsync(wt_host_, wt_, sizeof(float) * T * K, cudaMemcpyDeviceToHost, s);
+                cudaMemcpyAsync(h_host_, h_, sizeof(float) * T * E, cudaMemcpyDeviceToHost, s);
+                if (!cuda_ok(cudaStreamSynchronize(s), "router", err)) return false;
+                int32_t slots[kMaxT * kRouterMaxUsed];
+                for (int i = 0; i < T * K; ++i) {
+                    const int slot = resident_[(size_t) l][(size_t) ids_host_[i]];
+                    ++stats_.expert_uses;
+                    if (slot >= 0) ++stats_.expert_hits;
+                    slots[i] = slot;
+                    ids_host_[i] = slot >= 0 ? -1 : ids_host_[i];   // the CPU's share: the misses
+                }
+                cudaMemcpyAsync(slots_, slots, sizeof(int32_t) * T * K, cudaMemcpyHostToDevice, s);
+                cudaMemsetAsync(y_, 0, sizeof(float) * T * E, s);
+                mxfp4_experts(slot_ptr_, slots_, wt_, h_, y_, T, K, mx_scratch_, s);
+                const auto c0 = std::chrono::steady_clock::now();
+                cpu_->run_layer(l, T, h_host_, K, ids_host_, wt_host_, cpu_out_host_);
+                stats_.cpu_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
+                cudaMemcpyAsync(cpu_out_, cpu_out_host_, sizeof(float) * T * E, cudaMemcpyHostToDevice, s);
+                add_scaled(y_, cpu_out_, 1.f, E * T, s);
+                if (!cuda_ok(cudaStreamSynchronize(s), "experts", err)) return false;   // `slots` and the pinned rows
+                dump("ffn_moe_out", l, y_, (size_t) E * 4, T);
+                add_scaled(x_, y_, 1.f, E * T, s);
+                dump("l_out", l, x_, (size_t) E * 4, T);
+                continue;
+            }
             // v0: route on the host; stage the non-resident experts into staging slots
             int32_t ids[kMaxT * kRouterMaxUsed], slots[kMaxT * kRouterMaxUsed];
             cudaMemcpyAsync(ids, ids_, sizeof(int32_t) * T * K, cudaMemcpyDeviceToHost, s);

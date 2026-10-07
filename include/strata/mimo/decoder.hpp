@@ -1,7 +1,9 @@
 // include/strata/mimo/decoder.hpp - MiMo-V2.6-Flash decode: windows of T = 1..8 consecutive tokens through all
 // 48 layers, the logits of every token out.
 //
-// v0 (this file) is the correctness path of docs/MIMO_PORT_PLAN.md step 6: synchronous, no CUDA graph, every
+// v1: the routed experts that are not resident are computed by the CPU (CpuExperts, step 2) while the GPU computes
+// the resident ones; one host round trip per MoE layer, no CUDA graph yet.  With cpu_experts off it is v0:
+// v0 is the correctness path of docs/MIMO_PORT_PLAN.md step 6: synchronous, no CUDA graph, every
 // expert computed on the GPU.  The resident experts (the profile's most used, as many as the VRAM budget holds)
 // stay in their slots; a routed expert that is not resident is copied from the mapped GGUF into a staging slot for
 // that window.  Its job is to be right (checked against llama.cpp with tools/mimo/mimo_parity.py) and to give the
@@ -15,21 +17,29 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <memory>
 #include <string>
 #include <vector>
 
+namespace strata::kernels::cpu { class ExpertPool; }
+
 namespace strata::mimo {
+
+class CpuExperts;
 
 struct DecoderConfig {
     int max_ctx = 262144;           // positions of the global layers' KV caches
     double expert_budget_gib = 0;   // VRAM for resident experts; 0 = everything left after the rest, minus a margin
     std::string profile;            // MIMOPROF file (tools/mimo/make_profile.py); empty = no resident experts
     std::string dump_dir;           // when set: every intermediate, named as llama.cpp names it, appended per window
+    bool cpu_experts = true;        // non-resident experts on the CPU (v1); false: copied into GPU staging slots (v0)
+    bool ram_copy = true;           // CPU experts read from a RAM copy of every MoE layer (else the GGUF mapping)
 };
 
 struct DecoderStats {
     uint64_t expert_uses = 0, expert_hits = 0;   // routed (token, expert) pairs, and those served from a resident slot
     uint64_t staged = 0;                         // experts copied into a staging slot (distinct per window and layer)
+    double cpu_ms = 0;                           // time spent in CpuExperts::run_layer
 };
 
 class MimoDecoder {
@@ -73,6 +83,14 @@ private:
     int n_resident_ = 0, n_staging_ = 0;
     std::vector<std::vector<int>> resident_;   // [layer][expert] -> slot, -1 = not resident
     std::vector<unsigned long long> slot_addr_;
+    // v1: the CPU's share
+    std::unique_ptr<kernels::cpu::ExpertPool> pool_;
+    std::unique_ptr<CpuExperts> cpu_;
+    std::vector<void*> ram_;                   // RAM copies of the MoE layers' experts (VirtualAlloc / malloc)
+    float *h_host_ = nullptr, *wt_host_ = nullptr, *cpu_out_host_ = nullptr;   // pinned
+    int32_t* ids_host_ = nullptr;              // pinned
+    float* cpu_out_ = nullptr;                 // device copy of the CPU's sums
+    long long prev_affinity_ = -1;
 };
 
 }  // namespace strata::mimo
