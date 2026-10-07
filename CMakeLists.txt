@@ -425,11 +425,16 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
 
   # ---- MiMo-V2.6-Flash (docs/MIMO_PORT_PLAN.md) -------------------------------------------------------------
-  add_library(strata_mimo STATIC src/mimo/model.cpp)
+  add_library(strata_mimo STATIC src/mimo/model.cpp src/mimo/router.cu)
   target_include_directories(strata_mimo PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   target_link_libraries(strata_mimo PUBLIC strata_artifact strata_warnings ${_strata_gpu_runtime_target})
   add_executable(strata-mimo-inspect src/program/mimo_inspect.cpp)
   target_link_libraries(strata-mimo-inspect PRIVATE strata_mimo)
+  if(STRATA_BUILD_TESTS)
+    # the router against a double-precision reference on the real router weights (needs the model and a GPU)
+    add_executable(mimo_router_test src/mimo/router_test.cpp)
+    target_link_libraries(mimo_router_test PRIVATE strata_mimo)
+  endif()
 
   if(STRATA_ENABLE_HIP)
     enable_testing()
