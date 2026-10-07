@@ -87,8 +87,8 @@ MimoDecoder::~MimoDecoder() {
     cpu_.reset();
     pool_.reset();
     for (void* p : ram_) {
-        if (cfg_.batched_prefill) PrefillMoe::unregister_host(p);
-        std::free(p);
+        if (ram_pinned_) cudaFreeHost(p);
+        else std::free(p);
     }
     for (void* p : {(void*) h_host_, (void*) wt_host_, (void*) cpu_out_host_, (void*) ids_host_})
         if (p) cudaFreeHost(p);
@@ -153,15 +153,7 @@ bool MimoDecoder::init(std::string& err) {
             const cpu::CpuTopology topo = cpu::detect_cpu_topology(true);
             if (topo.host_core >= 0) prev_affinity_ = cpu::pin_current_thread(topo.host_core);   // the host works too
         }
-        cpu_ = std::make_unique<CpuExperts>(model_, *pool_);
-        if (cfg_.ram_copy)
-            for (int l = 0; l < g.n_layer; ++l) {
-                if (!g.is_moe(l)) continue;
-                void* p = std::malloc(cpu_->layer_bytes(l));
-                if (!p) { err = "out of RAM for the experts' copy (layer " + std::to_string(l) + ")"; return false; }
-                ram_.push_back(p);
-                cpu_->copy_layer(l, (uint8_t*) p, 16);
-            }
+        cpu_ = std::make_unique<CpuExperts>(model_, *pool_);   // the RAM copy is made at the end of init
         const size_t act = (size_t) kMaxT * E * 4, small = (size_t) kMaxT * kRouterMaxUsed * 4;
         if (!cuda_ok(cudaMallocHost(&h_host_, act), "pinned", err) || !cuda_ok(cudaMallocHost(&cpu_out_host_, act), "pinned", err) ||
             !cuda_ok(cudaMallocHost(&wt_host_, small), "pinned", err) || !cuda_ok(cudaMallocHost(&ids_host_, small), "pinned", err) ||
@@ -244,14 +236,26 @@ bool MimoDecoder::init(std::string& err) {
         return false;
     cudaMemGetInfo(&free_b, &total_b);
     vram_free_after_init_ = free_b;
-    // the RAM copy pinned, so the prompt path's copies of non-resident experts run at full PCIe speed - LAST: on
-    // Windows, registering ~150 GB of host memory lowers the free VRAM cudaMemGetInfo reports by tens of GiB, which
-    // would have shrunk the expert budget measured above
-    if (cfg_.batched_prefill && pmoe_) {
-        size_t i = 0;
-        for (int l = 0; l < g.n_layer; ++l)
-            if (g.is_moe(l) && i < ram_.size() && !PrefillMoe::register_host(ram_[i++], cpu_->layer_bytes(l), err))
+    // The CPU's copy of every MoE layer's experts - LAST, after the expert budget: on Windows, pinning ~150 GB of host
+    // memory lowers the free VRAM cudaMemGetInfo reports by tens of GiB.  With the prompt path it is pinned memory
+    // from cudaHostAlloc: its copies of non-resident experts run at 56-57 GB/s (44-46 with cudaHostRegister on a
+    // malloc), it starts no slower (the fill takes no page faults), and the CPU reads it as fast
+    // (docs/MIMO_PREFILL_MOE.md).
+    if (cpu_ && cfg_.ram_copy) {
+        ram_pinned_ = cfg_.batched_prefill && pmoe_ != nullptr;
+        for (int l = 0; l < g.n_layer; ++l) {
+            if (!g.is_moe(l)) continue;
+            void* p = nullptr;
+            if (ram_pinned_) {
+                if (!cuda_ok(cudaHostAlloc(&p, cpu_->layer_bytes(l), cudaHostAllocPortable), "pinned RAM for the experts", err))
+                    return false;
+            } else if (!(p = std::malloc(cpu_->layer_bytes(l)))) {
+                err = "out of RAM for the experts' copy (layer " + std::to_string(l) + ")";
                 return false;
+            }
+            ram_.push_back(p);
+            cpu_->copy_layer(l, (uint8_t*) p, 16);
+        }
     }
     return true;
 }

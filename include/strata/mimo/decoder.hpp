@@ -41,7 +41,7 @@ struct DecoderConfig {
     bool profile_gpu = false;       // v2: GPU timestamps per layer (print_profile)
     std::string mtp_path;           // the MTP GGUF (mtp-*.gguf): enables mtp_forward (draft head = its first layer)
     bool batched_prefill = true;    // prompts of more than 64 tokens through the batched path (src/mimo/prefill.cpp)
-    int prefill_slice = 4096;       // tokens per layer-major slice (each non-resident expert copied once per slice)
+    int prefill_slice = 16384;       // tokens per layer-major slice (each non-resident expert copied once per slice)
     int prefill_tile = 2048;        // tokens per attention / dense GEMM tile within a slice
 };
 
@@ -133,7 +133,8 @@ private:
     // v1: the CPU's share
     std::unique_ptr<kernels::cpu::ExpertPool> pool_;
     std::unique_ptr<CpuExperts> cpu_;
-    std::vector<void*> ram_;                   // RAM copies of the MoE layers' experts (VirtualAlloc / malloc)
+    std::vector<void*> ram_;                   // RAM copies of the MoE layers' experts (cudaHostAlloc or malloc)
+    bool ram_pinned_ = false;
     float *h_host_ = nullptr, *wt_host_ = nullptr, *cpu_out_host_ = nullptr;   // pinned
     int32_t* ids_host_ = nullptr;              // pinned
     float* cpu_out_ = nullptr;                 // device copy of the CPU's sums
