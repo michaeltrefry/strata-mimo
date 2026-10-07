@@ -69,6 +69,10 @@ MimoDecoder::~MimoDecoder() {
     if (stream_) cudaStreamSynchronize(stream_);
     for (auto& ge : graphs_)
         if (ge) cudaGraphExecDestroy(ge);
+    for (auto& ge : mtp_graphs_)
+        if (ge) cudaGraphExecDestroy(ge);
+    attn_kv_free(mtp_kv_);
+    if (mtp_arena_) cudaFree(mtp_arena_);
     for (void* p : {(void*) h_x_, (void*) h_w_, (void*) h_out_, (void*) h_ids_, (void*) h_seq_, (void*) h_flag_})
         if (p) cudaFreeHost(p);
     for (auto& kv : kv_) attn_kv_free(kv);
@@ -119,6 +123,13 @@ bool MimoDecoder::init(std::string& err) {
     if (!attn_scratch_alloc(attn_scratch_, 0, err)) return false;
     if (!cuda_ok(cudaMallocHost(&pinned_, kMxSlotBytes), "pinned staging", err)) return false;
 
+    // the MTP layer before the experts: everything else must be in VRAM before the expert budget takes what is left
+    // (on Windows an allocation past the VRAM does not fail, it lands in system memory and runs at PCIe speed)
+    if (!cfg_.mtp_path.empty()) {
+        if (!dev(kMaxT * E * 4, &e_) || !dev(kMaxT * E * 8, &cat_) || !dev(kMaxT * E * 4, &mres_) ||
+            !dev(kMaxT * 4, &mtp_tok_) || !dev(4, &mtp_pos0_) || !load_mtp(err))
+            return false;
+    }
     // v1: the CPU computes the non-resident experts, from a RAM copy of every MoE layer
     if (cfg_.cpu_experts) {
         // MIMO_HOST_CORE=last: the host loop on the last physical core and one worker fewer, away from core 0
@@ -191,11 +202,15 @@ bool MimoDecoder::init(std::string& err) {
     n_resident_ = (int) pick.size();
     const int n_slots = n_resident_ + n_staging_;
     slot_addr_.resize((size_t) n_slots);
-    for (int i = 0; i < n_slots; ++i) {   // one allocation per slot keeps a failed big cudaMalloc from costing it all
+    // slots in chunks of 64 (816 MiB): a slot on its own would be rounded up to whole 2 MiB pages (14 MiB for 12.75),
+    // and on Windows the overshoot does not fail - it lands in system memory and those experts run at PCIe speed
+    constexpr int kChunk = 64;
+    for (int i = 0; i < n_slots; i += kChunk) {
+        const int n = std::min(kChunk, n_slots - i);
         void* p = nullptr;
-        if (!cuda_ok(cudaMalloc(&p, kMxSlotBytes), "expert slot", err)) return false;
+        if (!cuda_ok(cudaMalloc(&p, (size_t) n * kMxSlotBytes), "expert slots", err)) return false;
         allocs_.push_back(p);
-        slot_addr_[(size_t) i] = (unsigned long long) p;
+        for (int j = 0; j < n; ++j) slot_addr_[(size_t) (i + j)] = (unsigned long long) p + (size_t) j * kMxSlotBytes;
     }
     if (!dev(sizeof(unsigned long long) * n_slots, &slot_ptr_)) return false;
     cudaMemcpy(slot_ptr_, slot_addr_.data(), sizeof(unsigned long long) * n_slots, cudaMemcpyHostToDevice);
@@ -216,7 +231,126 @@ bool MimoDecoder::init(std::string& err) {
     if (cfg_.profile_gpu && !dev(sizeof(unsigned long long) * (size_t) g.n_layer * 5, &stamps_)) return false;
     std::vector<int32_t> flat;
     for (const auto& r : resident_) flat.insert(flat.end(), r.begin(), r.end());
-    return cuda_ok(cudaMemcpy(d_res_, flat.data(), sizeof(int32_t) * flat.size(), cudaMemcpyHostToDevice), "residency", err);
+    if (!cuda_ok(cudaMemcpy(d_res_, flat.data(), sizeof(int32_t) * flat.size(), cudaMemcpyHostToDevice), "residency", err))
+        return false;
+    cudaMemGetInfo(&free_b, &total_b);
+    vram_free_after_init_ = free_b;
+    return true;
+}
+
+// The first nextn layer of the MTP GGUF into VRAM (its own copies of the embedding and head are not needed: llama.cpp
+// also uses the main model's when nextn.embed_tokens / shared_head_head are absent, as they are here).
+bool MimoDecoder::load_mtp(std::string& err) {
+    const MimoGeometry& g = model_.geometry();
+    try {
+        GgufModel mtp = GgufModel::open(cfg_.mtp_path);
+        const MetaValue* arch = mtp.meta().get("general.architecture");
+        const MetaValue* nn = mtp.meta().get("mimo2.nextn_predict_layers");
+        if (!arch || arch->s != "mimo2" || !nn || nn->u < 1) {
+            err = cfg_.mtp_path + " is not a MiMo MTP file (mimo2 with nextn_predict_layers)";
+            return false;
+        }
+        const int L = g.n_layer;   // the first nextn layer: blk.48
+        const std::string b = "blk." + std::to_string(L) + ".";
+        const uint64_t E = (uint64_t) g.n_embd, F = (uint64_t) g.n_ff_dense, Q = (uint64_t) g.qkv_rows(1);
+        struct Want { const char* name; DevTensor* dst; std::vector<uint64_t> shape; uint32_t type; };
+        const Want want[] = {
+            {"nextn.eh_proj.weight", &mtp_.eh_proj, {2 * E, E}, kTypeQ8_0},
+            {"nextn.enorm.weight", &mtp_.enorm, {E}, kTypeF32},
+            {"nextn.hnorm.weight", &mtp_.hnorm, {E}, kTypeF32},
+            {"attn_norm.weight", &mtp_.attn_norm, {E}, kTypeF32},
+            {"attn_qkv.weight", &mtp_.attn_qkv, {E, Q}, kTypeQ8_0},
+            {"attn_output.weight", &mtp_.attn_output, {(uint64_t) g.attn_out_in(), E}, kTypeQ8_0},
+            {"attn_sinks.weight", &mtp_.attn_sinks, {(uint64_t) g.n_head}, kTypeF32},
+            {"ffn_norm.weight", &mtp_.ffn_norm, {E}, kTypeF32},
+            {"ffn_gate.weight", &mtp_.ffn_gate, {E, F}, kTypeQ8_0},
+            {"ffn_up.weight", &mtp_.ffn_up, {E, F}, kTypeQ8_0},
+            {"ffn_down.weight", &mtp_.ffn_down, {F, E}, kTypeQ8_0},
+            {"layer_output_norm.weight", &mtp_.out_norm, {E}, kTypeF32},
+        };
+        size_t total = 0;
+        for (const Want& w : want) {
+            const TensorInfo* t = mtp.find(b + w.name);
+            if (!t || t->shape != w.shape || t->type != w.type) {
+                err = "MTP tensor " + b + w.name + (t ? " has an unexpected shape or type" : " is missing");
+                return false;
+            }
+            total += (tensor_payload_bytes(*t) + 255) / 256 * 256;
+        }
+        if (!cuda_ok(cudaMalloc(&mtp_arena_, total), "MTP weights", err)) return false;
+        size_t off = 0;
+        for (const Want& w : want) {
+            size_t shard = 0;
+            const TensorInfo* t = mtp.find(b + w.name, &shard);
+            const size_t bytes = (size_t) tensor_payload_bytes(*t);
+            uint8_t* dst = (uint8_t*) mtp_arena_ + off;
+            if (!cuda_ok(cudaMemcpy(dst, mtp.shard(shard).tensor_data(*t), bytes, cudaMemcpyHostToDevice), "MTP upload", err))
+                return false;
+            *w.dst = DevTensor{dst, t->type, (int64_t) t->shape[0], t->shape.size() > 1 ? (int64_t) t->shape[1] : 1, bytes};
+            off += (bytes + 255) / 256 * 256;
+        }
+    } catch (const std::exception& e) {
+        err = std::string("MTP: ") + e.what();
+        return false;
+    }
+    if (!attn_kv_alloc(mtp_kv_, g.n_head_kv[1], kSwaRing, true, err)) return false;
+    mtp_attn_ = attn_layer(g.n_head, g.n_head_kv[1], true, g.n_swa, g.rope_base_swa, g.head_k,
+                           (const float*) mtp_.attn_sinks.data);
+    return true;
+}
+
+// llama.cpp graph_mtp: cur = eh_proj([enorm(embed(tok)) | hnorm(h_prev)]); an SWA attention block with sinks and
+// value_scale; a dense SiLU FFN; then the head on layer_output_norm(cur).  h_prev = x_, the main window's final rows.
+void MimoDecoder::mtp_enqueue(int T) {
+    const MimoGeometry& g = model_.geometry();
+    const int E = g.n_embd;
+    cudaStream_t s = stream_;
+    embed_q8_0(model_.token_embd().data, mtp_tok_, e_, T, E, s);
+    mimo_rmsnorm(e_, (const float*) mtp_.enorm.data, e_, E, T, g.rms_eps, s);
+    mimo_rmsnorm(x_, (const float*) mtp_.hnorm.data, h_, E, T, g.rms_eps, s);
+    concat_rows(e_, h_, cat_, T, E, s);
+    q8_0_gemv(mtp_.eh_proj, cat_, q8_, mres_, T, s);
+    mimo_rmsnorm(mres_, (const float*) mtp_.attn_norm.data, h_, E, T, g.rms_eps, s);
+    q8_0_gemv(mtp_.attn_qkv, h_, q8_, qkv_, T, s);
+    mimo_qkv_rope_append(qkv_, mtp_pos0_, T, mtp_attn_, mtp_kv_, q_, s);
+    mimo_attn_decode(q_, mtp_pos0_, T, mtp_attn_, mtp_kv_, attn_scratch_, a_, s);
+    q8_0_gemv(mtp_.attn_output, a_, q8_, y_, T, s);
+    mimo_residual_add(mres_, y_, g.value_scale, E * T, s);
+    mimo_rmsnorm(mres_, (const float*) mtp_.ffn_norm.data, h_, E, T, g.rms_eps, s);
+    q8_0_gemv(mtp_.ffn_gate, h_, q8_, g_, T, s);
+    q8_0_gemv(mtp_.ffn_up, h_, q8_, u_, T, s);
+    silu_mul(g_, u_, m_, T * g.n_ff_dense, s);
+    q8_0_gemv(mtp_.ffn_down, m_, q8_, y_, T, s);
+    add_scaled(mres_, y_, 1.f, E * T, s);
+    mimo_rmsnorm(mres_, (const float*) mtp_.out_norm.data, h_, E, T, g.rms_eps, s);
+    q8_0_gemv(model_.output(), h_, q8_, logits_, T, s);
+    argmax_rows(logits_, next_, T, g.n_vocab, s);
+}
+
+bool MimoDecoder::mtp_forward(const int32_t* tokens, int T, int pos0, int32_t* draft, std::string& err) {
+    if (!mtp_arena_) { err = "no MTP layer loaded"; return false; }
+    if (T < 1 || T > kMaxT) { err = "MTP window out of range"; return false; }
+    cudaStream_t s = stream_;
+    cudaMemcpyAsync(mtp_tok_, tokens, sizeof(int32_t) * T, cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync(mtp_pos0_, &pos0, sizeof(int32_t), cudaMemcpyHostToDevice, s);
+    if (cfg_.graph) {
+        if (!mtp_graphs_[T]) {
+            cudaGraph_t graph = nullptr;
+            if (!cuda_ok(cudaStreamSynchronize(s), "MTP inputs", err) ||
+                !cuda_ok(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal), "MTP capture", err))
+                return false;
+            mtp_enqueue(T);
+            if (!cuda_ok(cudaStreamEndCapture(s, &graph), "MTP end capture", err)) return false;
+            const cudaError_t st = cudaGraphInstantiate(&mtp_graphs_[T], graph, 0);
+            cudaGraphDestroy(graph);
+            if (!cuda_ok(st, "MTP instantiate", err)) return false;
+        }
+        if (!cuda_ok(cudaGraphLaunch(mtp_graphs_[T], s), "MTP launch", err)) return false;
+    } else {
+        mtp_enqueue(T);
+    }
+    cudaMemcpyAsync(draft, next_, sizeof(int32_t) * T, cudaMemcpyDeviceToHost, s);
+    return cuda_ok(cudaStreamSynchronize(s), "MTP", err);   // `tokens`, `pos0` and `draft` are the caller's
 }
 
 void MimoDecoder::release_gpu_waits() {

@@ -43,6 +43,14 @@ __global__ void resident_slots_kernel(const int32_t* __restrict__ ids, const int
     if (i < n) slots[i] = res[ids[i]];
 }
 
+__global__ void concat_rows_kernel(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ o, int n) {
+    const int t = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        o[(size_t) t * 2 * n + i] = a[(size_t) t * n + i];
+        o[(size_t) t * 2 * n + n + i] = b[(size_t) t * n + i];
+    }
+}
+
 constexpr int kArgmaxThreads = 1024;
 
 __global__ void argmax_kernel(const float* __restrict__ logits, int32_t* __restrict__ ids, int n_vocab) {
@@ -94,6 +102,10 @@ void fill_zero(float* x, int n, cudaStream_t s) { fill_zero_kernel<<<(n + 255) /
 
 void resident_slots(const int32_t* ids, const int32_t* res_layer, int32_t* slots, int n, cudaStream_t s) {
     resident_slots_kernel<<<1, (n + 31) / 32 * 32, 0, s>>>(ids, res_layer, slots, n);
+}
+
+void concat_rows(const float* a, const float* b, float* out, int T, int n, cudaStream_t s) {
+    concat_rows_kernel<<<dim3((n + 255) / 256, T), 256, 0, s>>>(a, b, out, n);
 }
 
 void argmax_rows(const float* logits, int32_t* ids, int T, int n_vocab, cudaStream_t s) {

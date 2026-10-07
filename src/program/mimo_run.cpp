@@ -42,6 +42,7 @@ int main(int argc, char** argv) {
         else if (a == "--ram-copy") cfg.ram_copy = std::atoi(argv[i + 1]) != 0;
         else if (a == "--graph") cfg.graph = std::atoi(argv[i + 1]) != 0;
         else if (a == "--profile-gpu") cfg.profile_gpu = std::atoi(argv[i + 1]) != 0;
+        else if (a == "--mtp") cfg.mtp_path = argv[i + 1];
         else {
             std::fprintf(stderr, "unknown option %s\n", a.c_str());
             return 2;
@@ -71,16 +72,26 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "FAIL: %s\n", err.c_str());
             return 1;
         }
-        std::printf("ready in %.1f s: %d resident experts, context %d\n",
-                    std::chrono::duration<double>(clk::now() - t0).count(), dec.resident_experts(), cfg.max_ctx);
-        int32_t next[8];
+        std::printf("ready in %.1f s: %d resident experts, context %d, %.2f GiB of VRAM left\n",
+                    std::chrono::duration<double>(clk::now() - t0).count(), dec.resident_experts(), cfg.max_ctx,
+                    dec.vram_free_after_init() / 1073741824.0);
+        int32_t next[8], draft[8] = {0};
         int pos = 0, last = 0;   // next[last]: the prediction after the prompt's final token
+        const bool mtp = dec.has_mtp();
         t0 = clk::now();
         while (pos < (int) prompt.size()) {
             const int T = std::min(window, (int) prompt.size() - pos);
             if (!dec.forward(prompt.data() + pos, T, pos, next, nullptr, err)) {
                 std::fprintf(stderr, "FAIL at %d: %s\n", pos, err.c_str());
                 return 1;
+            }
+            if (mtp) {   // the MTP layer's KV: position p pairs token p with the main model's state at p - 1
+                int32_t mt[8];
+                for (int t = 0; t < T; ++t) mt[t] = pos + t + 1 < (int) prompt.size() ? prompt[(size_t) (pos + t + 1)] : next[T - 1];
+                if (!dec.mtp_forward(mt, T, pos + 1, draft, err)) {
+                    std::fprintf(stderr, "FAIL (MTP) at %d: %s\n", pos, err.c_str());
+                    return 1;
+                }
             }
             pos += T;
             last = T - 1;
@@ -91,15 +102,59 @@ int main(int argc, char** argv) {
         dec.reset_profile();   // the generation's windows only
         std::vector<int32_t> out;
         int32_t tok = next[last];
+        int windows = 0, accepted = 0;
+        double ms_main = 0, ms_mtp = 0;
         t0 = clk::now();
-        for (int i = 0; i < generate; ++i) {
-            out.push_back(tok);
-            if (!dec.forward(&tok, 1, pos, next, nullptr, err)) {
-                std::fprintf(stderr, "FAIL at %d: %s\n", pos, err.c_str());
-                return 1;
+        if (mtp) {
+            // verify [tok, d] at pos: the main model's prediction after tok decides whether d stands; the MTP layer
+            // then takes the accepted positions (and drafts the next d from the last of them)
+            int32_t d = draft[last];
+            while ((int) out.size() < generate) {
+                int32_t win[2] = {tok, d};
+                const auto m0 = clk::now();
+                const bool ok_main = dec.forward(win, 2, pos, next, nullptr, err);
+                ms_main += std::chrono::duration<double, std::milli>(clk::now() - m0).count();
+                if (!ok_main) {
+                    std::fprintf(stderr, "FAIL at %d: %s\n", pos, err.c_str());
+                    return 1;
+                }
+                ++windows;
+                int32_t mt[2];
+                int A;
+                out.push_back(tok);
+                if (next[0] == d) {
+                    out.push_back(d);
+                    ++accepted;
+                    mt[0] = d;
+                    mt[1] = next[1];
+                    tok = next[1];
+                    A = 2;
+                } else {
+                    mt[0] = next[0];
+                    tok = next[0];
+                    A = 1;
+                }
+                const auto m1 = clk::now();
+                const bool ok_mtp = dec.mtp_forward(mt, A, pos + 1, draft, err);
+                ms_mtp += std::chrono::duration<double, std::milli>(clk::now() - m1).count();
+                if (!ok_mtp) {
+                    std::fprintf(stderr, "FAIL (MTP) at %d: %s\n", pos, err.c_str());
+                    return 1;
+                }
+                d = draft[A - 1];
+                pos += A;
             }
-            ++pos;
-            tok = next[0];
+            out.resize((size_t) generate);
+        } else {
+            for (int i = 0; i < generate; ++i) {
+                out.push_back(tok);
+                if (!dec.forward(&tok, 1, pos, next, nullptr, err)) {
+                    std::fprintf(stderr, "FAIL at %d: %s\n", pos, err.c_str());
+                    return 1;
+                }
+                ++pos;
+                tok = next[0];
+            }
         }
         if (generate > 0) {
             const double gs = std::chrono::duration<double>(clk::now() - t0).count();
@@ -110,6 +165,12 @@ int main(int argc, char** argv) {
                         generate, gs, generate / gs, 100.0 * (st.expert_hits - before.expert_hits) / uses,
                         (double) (st.staged - before.staged) / generate, (st.cpu_ms - before.cpu_ms) / generate,
                         (st.wait_ms - before.wait_ms) / generate);
+            if (mtp)
+                std::printf("MTP: %d windows, %d drafts accepted (%.1f%%), %.2f tokens per window\n", windows, accepted,
+                            100.0 * accepted / std::max(windows, 1), (double) generate / std::max(windows, 1));
+            if (mtp)
+                std::printf("per window: main %.2f ms, MTP %.2f ms\n", ms_main / std::max(windows, 1),
+                            ms_mtp / std::max(windows, 1));
             dec.print_profile();
             std::printf("tokens:");
             for (int32_t t : out) std::printf(" %d", t);

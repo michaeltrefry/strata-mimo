@@ -36,6 +36,7 @@ struct DecoderConfig {
     bool ram_copy = true;           // CPU experts read from a RAM copy of every MoE layer (else the GGUF mapping)
     bool graph = true;              // v2: one CUDA graph per window size, the CPU handoff inside it (no dump)
     bool profile_gpu = false;       // v2: GPU timestamps per layer (print_profile)
+    std::string mtp_path;           // the MTP GGUF (mtp-*.gguf): enables mtp_forward (draft head = its first layer)
 };
 
 struct DecoderStats {
@@ -60,6 +61,14 @@ public:
     /// null, the full logits [T][n_vocab].
     bool forward(const int32_t* tokens, int T, int pos0, int32_t* next, std::vector<float>* logits, std::string& err);
 
+    /// MTP draft (needs cfg.mtp_path).  Runs the first nextn layer over positions pos0 .. pos0+T-1 with tokens[t] and
+    /// the main model's final hidden state of the previous position, which must be row t of the last forward()'s
+    /// window (so call this right after forward(), with pos0 = that window's pos0 + 1).  Writes the MTP layer's
+    /// greedy prediction for each position + 1 to draft[t]; it also fills the layer's own KV (sliding window).
+    bool mtp_forward(const int32_t* tokens, int T, int pos0, int32_t* draft, std::string& err);
+    bool has_mtp() const { return mtp_arena_ != nullptr; }
+    size_t vram_free_after_init() const { return vram_free_after_init_; }
+
     const DecoderStats& stats() const { return stats_; }
     /// With profile_gpu: per MoE layer, the averages since init of (layer start -> doorbell, doorbell -> resident
     /// experts done, -> CPU flag seen, -> layer end) in microseconds, printed as one table.
@@ -69,6 +78,8 @@ public:
 
 private:
     bool forward_graph(int T, int pos0, int32_t* next, std::string& err);
+    bool load_mtp(std::string& err);
+    void mtp_enqueue(int T);
     bool capture(int T, std::string& err);
     void release_gpu_waits();
     void dump(const char* name, int layer, const void* dev, size_t bytes_per_token, int T, bool is_int = false);
@@ -91,6 +102,7 @@ private:
     void* raw_ = nullptr;           // one expert in GGUF layout, before relayout into a staging slot
     unsigned long long* slot_ptr_ = nullptr;   // device address of every slot: resident first, then staging
     int n_resident_ = 0, n_staging_ = 0;
+    size_t vram_free_after_init_ = 0;
     std::vector<std::vector<int>> resident_;   // [layer][expert] -> slot, -1 = not resident
     std::vector<unsigned long long> slot_addr_;
     // v1: the CPU's share
@@ -108,6 +120,17 @@ private:
     int32_t *h_ids_ = nullptr, *m_ids_ = nullptr;
     uint32_t *h_seq_ = nullptr, *m_seq_ = nullptr, *h_flag_ = nullptr, *m_flag_ = nullptr;
     unsigned long long* stamps_ = nullptr;     // device [48 * 5] GPU %globaltimer stamps of the last window
+    // MTP: the first nextn layer (blk.48 of the MTP GGUF); the embedding and the head are the main model's
+    struct MtpLayer {
+        DevTensor eh_proj, enorm, hnorm, attn_norm, attn_qkv, attn_output, attn_sinks, ffn_norm, ffn_gate, ffn_up,
+            ffn_down, out_norm;
+    } mtp_;
+    void* mtp_arena_ = nullptr;
+    AttnKv mtp_kv_{};
+    AttnLayer mtp_attn_{};
+    cudaGraphExec_t mtp_graphs_[9] = {};
+    float *e_ = nullptr, *cat_ = nullptr, *mres_ = nullptr;
+    int32_t *mtp_tok_ = nullptr, *mtp_pos0_ = nullptr;
     std::vector<double> prof_us_;              // accumulated [48 * 4] intervals
     int prof_windows_ = 0;
 };

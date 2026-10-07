@@ -22,6 +22,9 @@ void fill_zero(float* x, int n, cudaStream_t s);
 /// slots[i] = res_layer[ids[i]] for n routed experts: the resident slot, or -1 (computed by the CPU).
 void resident_slots(const int32_t* ids, const int32_t* res_layer, int32_t* slots, int n, cudaStream_t s);
 
+/// out[t] = [a[t] | b[t]]: T rows of 2n from two [T][n] inputs (MTP's concat of the token and hidden norms).
+void concat_rows(const float* a, const float* b, float* out, int T, int n, cudaStream_t s);
+
 /// ids[t] = argmax_v logits[t * n_vocab + v] (ties: the lower id), for T rows.
 void argmax_rows(const float* logits, int32_t* ids, int T, int n_vocab, cudaStream_t s);
 
