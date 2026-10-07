@@ -97,9 +97,10 @@ void mimo_qkv_rope_append(const float* qkv, const int32_t* pos0, int T, const At
 /// Attention of the T roped queries over keys [lo, pos0 + T) (lo = 0, or pos0 - n_swa + 1 on SWA layers) of `kv`,
 /// which must already hold the window's own keys (mimo_qkv_rope_append first). out: [T][n_head][128] F32.
 /// max_splits <= 0 uses attn_default_splits(L.n_kv) (capped at s.blocks / n_kv). SWA layers with T = 1 use one
-/// block per KV head and no combine kernel.
+/// block per KV head and no combine kernel.  out_q8_1: when set, `out` is also written there as Q8_1 blocks
+/// (native_quantize_q8_1's codes and scales: the input of the attn_output MMVQ), by the combine kernel.
 void mimo_attn_decode(const float* q, const int32_t* pos0, int T, const AttnLayer& L, const AttnKv& kv,
-                      const AttnScratch& s, float* out, void* stream, int max_splits = 0);
+                      const AttnScratch& s, float* out, void* stream, int max_splits = 0, void* out_q8_1 = nullptr);
 
 /// x += scale * y (n floats): the residual add after attn_output, scale = value_scale.
 void mimo_residual_add(float* x, const float* y, float scale, int n, void* stream);

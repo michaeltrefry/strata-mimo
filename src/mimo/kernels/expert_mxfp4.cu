@@ -153,6 +153,7 @@ struct XQ {
     int4 q[4][2][32];
     float d[kGuBlocks];
 };
+static_assert(sizeof(XQ) == kMxXqBytes, "the layout in the header");
 
 // block t: token t (thread = 4 consecutive values, 8 threads = one 32-block; value 4c+i of a block is byte i of
 // its int c)
@@ -474,8 +475,10 @@ void mxfp4_experts(const unsigned long long* slot_ptr, const int32_t* slots, con
     }
     cudaStream_t s = (cudaStream_t) stream;
     const Scratch sc(scratch, T, K);
-    prepare_kernel<<<T, kThreads, 0, s>>>(x, sc.xq);
-    check("mxfp4_experts/prepare");
+    if (x) {   // else a fused kernel wrote sc.xq (the scratch's first T * kMxXqBytes)
+        prepare_kernel<<<T, kThreads, 0, s>>>(x, sc.xq);
+        check("mxfp4_experts/prepare");
+    }
     const dim3 ggu(kMxFF / kGuRows, (unsigned) (T * K));
     if (T == 1) launch_pdl(gate_up_kernel<1>, ggu, s, slot_ptr, slots, T, K, sc.xq, sc.hq, sc.hd);
     else if (T == 2) launch_pdl(gate_up_kernel<2>, ggu, s, slot_ptr, slots, T, K, sc.xq, sc.hq, sc.hd);

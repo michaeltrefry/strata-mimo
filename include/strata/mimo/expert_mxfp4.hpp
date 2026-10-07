@@ -44,6 +44,13 @@ void mxfp4_slot_relayout(const void* raw, void* slot, void* stream);
 /// Device scratch for a call with T tokens and K experts per token.
 size_t mxfp4_experts_scratch_bytes(int T, int K);
 
+/// The kernels' input: token t's x as q8_1 at scratch + t * kMxXqBytes (llama.cpp's q8_1 numbers: scale
+/// amax / 127 rounded to fp16, codes roundf(x / scale)), laid out for the gate/up lanes:
+///   int32 q[4][2][32][4]: q[j][hf][b][i] = codes 4 * (4 * hf + i) .. +3 of block 32 * j + b (bytes in order)
+///   float d[128]: block b's scale, as the fp16-rounded float
+/// mxfp4_experts writes it from x (its first kernel); a fused producer may write it instead and pass x = nullptr.
+inline constexpr size_t kMxXqBytes = 4 * 2 * 32 * 16 + (kMxEmbd / 32) * 4;
+
 /// The hit experts of one layer.  All pointers are device pointers; everything per token is read on the device,
 /// and the launch shapes depend on T and K only, so the call can be captured in a CUDA graph and replayed with new
 /// contents in the buffers.
@@ -51,7 +58,7 @@ size_t mxfp4_experts_scratch_bytes(int T, int K);
 ///   slots     [T][K] int32: the slot of each routed expert, or < 0 when it is not resident.  A token's slots must be
 ///             distinct (a repeat within one token is ignored)
 ///   weights   [T][K] float: the router weights
-///   x         [T][kMxEmbd] float: the FFN input (after ffn_norm)
+///   x         [T][kMxEmbd] float: the FFN input (after ffn_norm); nullptr: already in `scratch` (see kMxXqBytes)
 ///   out       [T][kMxEmbd] float: added to, never overwritten
 /// T in 1..kMxMaxT, K in 1..kMxMaxK.
 void mxfp4_experts(const unsigned long long* slot_ptr, const int32_t* slots, const float* weights, const float* x,

@@ -26,7 +26,9 @@
 //   P V  - output column g of n-tile j is dim 64 (j / 8) + 8 g + j % 8: one n-tile stays in one 64-dim V group
 //          (one scale per key) and each thread reads 8 consecutive codes per key and group.
 #include "strata/mimo/attn.hpp"
+#include "q8_1.cuh"
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -421,7 +423,8 @@ __global__ void __launch_bounds__(DV) attn_combine_kernel(const float* __restric
                                                           const float* __restrict__ mlpart,
                                                           const int32_t* __restrict__ pos0p, int T, int G, int n_kv,
                                                           int swa, int n_swa, int max_splits,
-                                                          const float* __restrict__ sinks, float* __restrict__ out) {
+                                                          const float* __restrict__ sinks, float* __restrict__ out,
+                                                          MimoQ81* __restrict__ out_q8) {
     __shared__ float w[MAX_SPLITS];
     __shared__ float red[DV / 32];
     const int hq = blockIdx.x, t = blockIdx.y, d = threadIdx.x, n_head = gridDim.x, lane = d & 31, warp = d >> 5;
@@ -458,7 +461,10 @@ __global__ void __launch_bounds__(DV) attn_combine_kernel(const float* __restric
         a3 += w[s + 3] * op[(size_t) (s + 3) * stride * DV];
     }
     for (; s < ns; ++s) a0 += w[s] * op[(size_t) s * stride * DV];
-    out[((size_t) t * n_head + hq) * DV + d] = ((a0 + a1) + (a2 + a3)) / den;
+    const size_t i = ((size_t) t * n_head + hq) * DV + d;
+    const float o = ((a0 + a1) + (a2 + a3)) / den;
+    out[i] = o;
+    if (out_q8) q8_1_warp(o, out_q8 + i / 32);   // a warp's 32 dims are one q8_1 block of attn_output's input
 }
 
 // NEOX rope, shared by the decode and the prompt append so both write the same codes for the same position:
@@ -1072,7 +1078,7 @@ void mimo_qkv_rope_append(const float* qkv, const int32_t* pos0, int T, const At
 }
 
 void mimo_attn_decode(const float* q, const int32_t* pos0, int T, const AttnLayer& L, const AttnKv& kv,
-                      const AttnScratch& s, float* out, void* stream, int max_splits) {
+                      const AttnScratch& s, float* out, void* stream, int max_splits, void* out_q8_1) {
     const int G = L.n_head / L.n_kv;
     if (T < 1 || T > kAttnMaxT || T * G > MAX_ROWS || L.n_head > kAttnMaxHeads || L.n_kv > s.blocks) {
         std::fprintf(stderr, "mimo_attn_decode: unsupported T %d / n_head %d / n_kv %d\n", T, L.n_head, L.n_kv);
@@ -1098,10 +1104,13 @@ void mimo_attn_decode(const float* q, const int32_t* pos0, int T, const AttnLaye
         case 7: launch_split<7>(q, pos0, T, L, kv, s, splits, direct, st); break;
         default: launch_split<8>(q, pos0, T, L, kv, s, splits, direct, st); break;
     }
-    if (direct) return;
+    if (direct) {
+        if (out_q8_1) kernels::native_quantize_q8_1(out, out_q8_1, L.n_head * DV, T, stream);
+        return;
+    }
     const dim3 grid((unsigned) L.n_head, (unsigned) T);
     attn_combine_kernel<<<grid, DV, 0, st>>>(s.o, s.ml, pos0, T, G, L.n_kv, L.swa ? 1 : 0, L.n_swa, splits, L.sinks,
-                                             out);
+                                             out, static_cast<MimoQ81*>(out_q8_1));
     check("attn_combine launch");
 }
 
