@@ -33,15 +33,15 @@ Errors are max |difference| / rms of the reference output, CPU reference in doub
 | llama.cpp q8_0 cache vs unquantized, same data | 1.3% - 21% |
 | llama.cpp f16 cache vs unquantized, same data | 0.10% - 1.3% |
 
-The synthetic queries are peaky on purpose (score standard deviation up to ~3.7), which magnifies the int8 error; the format costs about
-what llama.cpp's q8_0 cache costs. Also checked: the sink identity out(sink) = out(no sink) x Z / (Z + e^sink)
+The synthetic queries are peaky on purpose (score standard deviation up to ~3.7), which magnifies the int8 error;
+the format costs about what llama.cpp's q8_0 cache costs. Also checked: the sink identity out(sink) = out(no sink) x Z / (Z + e^sink)
 (2.5e-4), speculative sequences with rejected tokens over 600 positions (the ring wraps twice), rmsnorm (4e-7) and the
 residual add (bit-exact to ggml's scale-then-add).
 
 ## Speed (RTX PRO 6000 Blackwell Max-Q, 188 SMs, CUDA 12.9, `mimo_attn_test --bench`)
 
 One layer, attention kernels only (split + combine), inside a CUDA graph, KV read from DRAM (each call reads KV the
-previous calls did not touch). Best of 5 graph launches; the median was within 2% except where noted in the raw output.
+previous calls did not touch). Best of 5 graph launches; the medians were within 5% of it.
 
 | Layer | Positions | T = 1 | T = 2 | T = 4 | T = 8 |
 | --- | ---: | ---: | ---: | ---: | ---: |
