@@ -42,6 +42,7 @@ struct DecoderConfig {
     std::string mtp_path;           // the MTP GGUF (mtp-*.gguf): enables mtp_forward (draft head = its first layer)
     int mtp_heads = 1;              // 2: also the second nextn layer, for a second draft token (mtp_draft2)
     bool batched_prefill = true;    // prompts of more than 64 tokens through the batched path (src/mimo/prefill.cpp)
+    int batched_min_prompt = 128;   // shorter prompts run through decode windows (faster below ~128 tokens)
     int prefill_slice = 16384;       // tokens per layer-major slice (each non-resident expert copied once per slice)
     int prefill_tile = 2048;        // tokens per attention / dense GEMM tile within a slice
     int adapt_min_prompt = 2048;    // after a batched prompt this long, the resident set follows its routing too

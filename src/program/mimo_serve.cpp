@@ -128,6 +128,7 @@ int main(int argc, char** argv) {
         else if (a == "--expert-profile") val(cfg.profile);
         else if (a == "--max-context") { val(v); cfg.max_ctx = std::atoi(v.c_str()); }
         else if (a == "--budget-gib") { val(v); cfg.expert_budget_gib = std::atof(v.c_str()); }
+        else if (a == "--batched-min") { val(v); cfg.batched_min_prompt = std::atoi(v.c_str()); }
         else if (a == "--eos-ids") {
             val(v);
             eos.clear();

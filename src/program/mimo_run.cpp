@@ -45,6 +45,7 @@ int main(int argc, char** argv) {
         else if (a == "--mtp") cfg.mtp_path = argv[i + 1];
         else if (a == "--mtp-heads") cfg.mtp_heads = std::atoi(argv[i + 1]);
         else if (a == "--batched") cfg.batched_prefill = std::atoi(argv[i + 1]) != 0;
+        else if (a == "--batched-min") cfg.batched_min_prompt = std::atoi(argv[i + 1]);
         else if (a == "--adapt") cfg.adapt_weight = std::strtof(argv[i + 1], nullptr);
         else if (a == "--adapt-decode") cfg.adapt_decode = std::atoi(argv[i + 1]) != 0;
         else if (a == "--adapt-swaps") cfg.adapt_swaps = std::atoi(argv[i + 1]);

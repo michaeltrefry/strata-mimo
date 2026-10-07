@@ -263,7 +263,7 @@ bool MimoDecoder::init(std::string& err) {
     // malloc), it starts no slower (the fill takes no page faults), and the CPU reads it as fast
     // (docs/MIMO_PREFILL_MOE.md).
     if (cpu_ && cfg_.ram_copy) {
-        ram_pinned_ = cfg_.batched_prefill && pmoe_ != nullptr;
+        ram_pinned_ = (cfg_.batched_prefill && pmoe_ != nullptr) || !recent_.empty();   // prompt copies, decode swaps
         for (int l = 0; l < g.n_layer; ++l) {
             if (!g.is_moe(l)) continue;
             void* p = nullptr;
@@ -436,7 +436,7 @@ bool MimoDecoder::mtp_forward(const int32_t* tokens, int T, int pos0, int32_t* d
 
 bool MimoDecoder::prompt(const int32_t* tokens, int n, int pos0, const ChooseFn& choose, int32_t* first,
                          int32_t* draft, const std::function<void(int)>& progress, std::string& err) {
-    if (pmoe_ && n > 64) return prompt_batched(tokens, n, pos0, choose, first, draft, progress, err);
+    if (pmoe_ && n >= cfg_.batched_min_prompt) return prompt_batched(tokens, n, pos0, choose, first, draft, progress, err);
     constexpr int W = kMaxT;
     const int V = model_.geometry().n_vocab;
     int32_t next[kMaxT], dr[kMaxT];
