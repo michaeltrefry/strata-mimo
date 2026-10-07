@@ -16,9 +16,12 @@
 // overlap = (copy_only + compute_only - full) / min(copy_only, compute_only): 1 = the shorter one is fully hidden.
 // The times exclude attention and the router; tok/s is P / (sum of the 47 layers' full time).
 //
-// usage: mimo_prefill_moe_bench <MiMo GGUF shard> --profile <MIMOPROF> [--p 512,2048,4096] [--resident 0.55]
+// --startup hostalloc|register: only the time to allocate, fill and pin the decoder's RAM copy of all 47 layers.
+//
+// usage: mimo_prefill_moe_bench <MiMo GGUF shard> --profile <MIMOPROF> [--p 4096,8192,16384,32768] [--resident 0.55]
 //        [--routing profile|uniform] [--layers N] [--reps 2] [--ram hostalloc|register] [--group 16]
-//        [--group-ram 8] [--staging 8] [--verbose]
+//        [--group-ram 8] [--staging 16] [--tile-rows 4096] [--vram-mib N] [--verbose]
+//        mimo_prefill_moe_bench <MiMo GGUF shard> --startup hostalloc|register
 #include "strata/mimo/expert_mxfp4.hpp"
 #include "strata/mimo/model.hpp"
 #include "strata/mimo/prefill_moe.hpp"
@@ -26,7 +29,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
-#include <atomic>
+#include <atomic>\n#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -85,6 +88,57 @@ void parallel(int n, int threads, const auto& fn) {
     for (auto& t : th) t.join();
 }
 
+// The decoder's RAM copy of all MoE layers, pinned two ways: cudaHostAlloc per layer then filled, or malloc, filled,
+// cudaHostRegister.  The fill is CpuExperts::copy_layer's: 64 MiB pieces from the GGUF mapping on 16 threads.
+int startup_time(const MimoModel& model, bool reg) {
+    const MimoGeometry& g = model.geometry();
+    auto now = [] { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+    double t_alloc = 0, t_fill = 0, t_reg = 0;
+    std::vector<uint8_t*> bufs;
+    size_t total = 0;
+    for (int l = 0; l < g.n_layer; ++l) {
+        if (!g.is_moe(l)) continue;
+        const ExpertSlices& xs = model.experts(l);
+        const size_t bytes = (size_t) NE * xs.expert_bytes();
+        double t0 = now();
+        uint8_t* p = nullptr;
+        if (reg) p = (uint8_t*) std::malloc(bytes);
+        else if (cudaHostAlloc((void**) &p, bytes, cudaHostAllocPortable) != cudaSuccess) p = nullptr;
+        if (!p) { std::fprintf(stderr, "allocation failed at layer %d\n", l); return 1; }
+        t_alloc += now() - t0;
+        t0 = now();
+        uint8_t* d = p;
+        for (int m = 0; m < 3; ++m) {
+            const size_t mb = (size_t) NE * xs.stride[m];
+            constexpr size_t kChunk = 64u << 20;
+            parallel((int) ((mb + kChunk - 1) / kChunk), 16, [&](int i) {
+                const size_t o = (size_t) i * kChunk;
+                std::memcpy(d + o, xs.base[m] + o, std::min(kChunk, mb - o));
+            });
+            d += mb;
+        }
+        t_fill += now() - t0;
+        if (reg) {
+            t0 = now();
+            std::string err;
+            if (!PrefillMoe::register_host(p, bytes, err)) { std::fprintf(stderr, "layer %d: %s\n", l, err.c_str()); return 1; }
+            t_reg += now() - t0;
+        }
+        bufs.push_back(p);
+        total += bytes;
+    }
+    std::printf("%s: %.1f GiB in %zu layers: allocate %.1f s, fill (copy_layer, 16 threads) %.1f s, register %.1f s; "
+                "total %.1f s\n", reg ? "malloc + cudaHostRegister" : "cudaHostAlloc", total / 1073741824.0, bufs.size(),
+                t_alloc, t_fill, t_reg, t_alloc + t_fill + t_reg);
+    const double t0 = now();
+    for (uint8_t* p : bufs) {
+        if (reg) { PrefillMoe::unregister_host(p); std::free(p); }
+        else cudaFreeHost(p);
+    }
+    std::printf("release: %.1f s\n", now() - t0);
+    return 0;
+}
+
 struct Acc {   // sums over layers for one P
     double full = 0, compute = 0, copy = 0, copy_span = 0, routing = 0, tail = 0;
     double bytes = 0;
@@ -98,11 +152,12 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: %s <MiMo GGUF shard> --profile <MIMOPROF> [--p 512,2048,4096] [--resident 0.55] "
                              "[--routing profile|uniform] [--layers N] [--reps 2] [--ram hostalloc|register] "
-                             "[--group 16] [--group-ram 8] [--staging 8] [--verbose]\n", argv[0]);
+                             "[--group 16] [--group-ram 8] [--staging 16] [--tile-rows 4096] [--vram-mib N] [--verbose] | "
+                             "--startup hostalloc|register\n", argv[0]);
         return 2;
     }
-    std::string profile, routing = "profile", ram_mode = "hostalloc";
-    std::vector<int> Ps = {512, 2048, 4096};
+    std::string profile, routing = "profile", ram_mode = "hostalloc", startup;
+    std::vector<int> Ps = {4096, 8192, 16384, 32768};
     double resident_share = 0.55;
     int max_layers = 1000, reps = 2;
     bool verbose = false;
@@ -119,12 +174,16 @@ int main(int argc, char** argv) {
         else if (arg("--group")) cfg.group = std::atoi(argv[++i]);
         else if (arg("--group-ram")) cfg.group_ram = std::atoi(argv[++i]);
         else if (arg("--staging")) cfg.staging = std::atoi(argv[++i]);
+        else if (arg("--tile-rows")) cfg.tile_rows = std::atoi(argv[++i]);
+        else if (arg("--vram-mib")) cfg.vram_mib = std::atoi(argv[++i]);
+        else if (arg("--startup")) startup = argv[++i];
         else if (!std::strcmp(argv[i], "--verbose")) verbose = true;
     }
     CK(cudaSetDevice(0));
     try {
         MimoModel model(argv[1]);
         const MimoGeometry& g = model.geometry();
+        if (!startup.empty()) return startup_time(model, startup == "register");
         std::vector<float> score;
         if (profile.empty() || !read_profile(profile, g.n_layer, score)) {
             std::fprintf(stderr, "need a MIMOPROF v1 profile for %d layers x %d experts (--profile)\n", g.n_layer, NE);
@@ -170,10 +229,10 @@ int main(int argc, char** argv) {
         if (!moe.init(err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
         size_t free1 = 0;
         CK(cudaMemGetInfo(&free1, &total0));
-        std::printf("VRAM: %.2f GiB slots + %.2f GiB prompt buffers (P <= %d, group %d / %d, staging %d); %.1f GiB "
-                    "free before, %.1f after\n", (double) max_res * kMxSlotBytes / 1073741824.0,
-                    moe.device_bytes() / 1073741824.0, cfg.max_tokens, cfg.group, cfg.group_ram, cfg.staging,
-                    free0 / 1073741824.0, free1 / 1073741824.0);
+        std::printf("VRAM: %.2f GiB slots + %.2f GiB prompt buffers (S <= %d, tiles of %d rows, group %d / %d, staging "
+                    "%d); %.1f GiB free before, %.1f after\n", (double) max_res * kMxSlotBytes / 1073741824.0,
+                    moe.device_bytes() / 1073741824.0, cfg.max_tokens, moe.config().tile_rows, cfg.group, cfg.group_ram,
+                    cfg.staging, free0 / 1073741824.0, free1 / 1073741824.0);
 
         // RAM: one layer at a time
         int first_moe = 0;
@@ -215,7 +274,7 @@ int main(int argc, char** argv) {
         int done = 0, warm = 0;
         const PrefillMoe::Mode modes[3] = {PrefillMoe::Mode::full, PrefillMoe::Mode::compute_only,
                                            PrefillMoe::Mode::copy_only};
-        if (verbose) std::printf("\nlayer      P  used copied  full ms  compute ms  copy ms  span ms  GB/s\n");
+        if (verbose) std::printf("\nlayer      S  used copied  full ms  compute ms  copy ms  span ms  GB/s\n");
         for (int l = 0; l < g.n_layer && done < max_layers; ++l) {
             if (!g.is_moe(l)) continue;
             ++done;
@@ -314,7 +373,7 @@ int main(int argc, char** argv) {
         }
         std::printf("\n\n%d MoE layers; MXFP4 blocks with an exponent outside 104..143 (Q8_0 not exact): %lld\n\n", done,
                     blocks_out_of_range);
-        std::printf("    P | used/layer copied/layer  GB copied | full ms  compute ms  copy ms | routing ms  tail ms | "
+        std::printf("    S | used/layer copied/layer  GB copied | full ms  compute ms  copy ms | routing ms  tail ms | "
                     "H2D GB/s (full / copy only) | overlap | MoE tok/s\n");
         for (size_t pi = 0; pi < Ps.size(); ++pi) {
             const Acc& a = acc[pi];

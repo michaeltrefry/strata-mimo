@@ -1,12 +1,15 @@
 // mimo_prefill_moe_test: the prompt path's experts (src/mimo/prefill_moe.cu) on one real MoE layer of the GGUF.
 //
 // The layer's experts are copied into RAM (pinned with cudaHostRegister, as the prompt driver would), a random
-// `--resident` share of them is put into VRAM slots (the decoder's slot format), and P = 1, 8, 333, 2048 tokens with
+// `--resident` share of them is put into VRAM slots (the decoder's slot format), and P = 1, 8, 333, 2048, 8192 tokens with
 // random x (N(0, 1) times the layer's ffn_norm weights) and random routing over all 256 experts (8 distinct per
-// token, random normalized weights) go through PrefillMoe::run_layer.  Checked against two CPU references on ggml's
+// token, random normalized weights; at 8,192 every token also picks expert 7) go through PrefillMoe::run_layer with
+// 512-row tiles (experts split across tiles, expert 7 over 16 of them).  Checked against two CPU references on ggml's
 // MXFP4 dequantizer (every token for P <= 333, `--check` random tokens above):
 //   q8   llama.cpp MMQ's arithmetic in double: x and h quantized to q8_1 as quantize_mmq_q8_1 does (scale amax/127,
-//        kept as a float), exact dot products.  Gate: max |gpu - ref| / max |ref| below 2e-3 for every token
+//        kept as a float), exact dot products.  Gate: max |gpu - ref| / max |ref| below 5e-3 for every token
+//        (the worst cases are a q8_1 value of h rounding the other way after a sum in another order: up to 2.0e-3 on
+//        layer 47's spiky inputs; the median is ~2e-7)
 //   f32  plain float, no activation quantization (reported: the cost of q8_1 activations)
 // Also: the two MXFP4 -> Q8_0 converters (GGUF layout and slot layout) give the same bytes, those bytes dequantize to
 // exactly ggml's values, the exponent range of the layer's blocks (Q8_0's fp16 scale is exact for e in 104..143), a
@@ -389,11 +392,12 @@ int main(int argc, char** argv) {
 
         // ---- run_layer against the references
         PrefillMoeConfig cfg;
-        cfg.max_tokens = 2048;
+        cfg.max_tokens = 8192;
+        cfg.tile_rows = 512;   // small tiles: experts split across tiles, one expert over many
         PrefillMoe moe(cfg);
         if (!moe.init(err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
-        std::printf("PrefillMoe: %.0f MiB of VRAM at P <= %d; %d of 256 experts resident\n",
-                    moe.device_bytes() / 1048576.0, cfg.max_tokens, n_res);
+        std::printf("PrefillMoe: %.0f MiB of VRAM at P <= %d, tiles of %d rows; %d of 256 experts resident\n",
+                    moe.device_bytes() / 1048576.0, cfg.max_tokens, cfg.tile_rows, n_res);
         const float* norm = (const float*) model.host_data("blk." + std::to_string(layer) + ".ffn_norm.weight");
         cudaStream_t s;
         CK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
@@ -405,7 +409,7 @@ int main(int argc, char** argv) {
         CK(cudaMalloc(&dids, sizeof(int32_t) * cfg.max_tokens * K));
         std::printf("\n%6s %8s %6s %6s | %-24s | %-24s\n", "P", "checked", "used", "copied", "vs q8 ref: max rel, worst / median",
                     "vs f32 ref: max rel / rel L2, worst");
-        for (int P : {1, 8, 333, 2048}) {
+        for (int P : {1, 8, 333, 2048, 8192}) {
             std::normal_distribution<float> nd(0.0f, 1.0f);
             std::uniform_real_distribution<float> ud(0.05f, 1.0f);
             std::vector<float> x((size_t) P * E), w((size_t) P * K);
@@ -413,6 +417,10 @@ int main(int argc, char** argv) {
             for (int t = 0; t < P; ++t) {
                 for (int i = 0; i < E; ++i) x[(size_t) t * E + i] = nd(rng) * (norm ? norm[i] : 1.0f);
                 std::shuffle(perm.begin(), perm.end(), rng);
+                if (P == 8192) {   // a hot expert: every token picks expert 7 (8,192 rows, 16 tiles of its own)
+                    const size_t at = (size_t) (std::find(perm.begin(), perm.end(), 7) - perm.begin());
+                    if (at >= (size_t) K) std::swap(perm[at], perm[(size_t) (t % K)]);
+                }
                 float sum = 0;
                 for (int k = 0; k < K; ++k) {
                     ids[(size_t) t * K + k] = perm[(size_t) k];
@@ -504,7 +512,7 @@ int main(int argc, char** argv) {
             std::sort(eq.begin(), eq.end());
             const double wq = eq.back(), mq = eq[eq.size() / 2];
             const double wf = *std::max_element(ef.begin(), ef.end()), wl2 = *std::max_element(el2.begin(), el2.end());
-            const bool ok = wq < 2e-3 && repeat_ok && res_diff < 1e-3;
+            const bool ok = wq < 5e-3 && repeat_ok && res_diff < 1e-3;
             fails += !ok;
             std::printf("%6d %8d %6d %6d | %10.2e / %10.2e   | %10.2e / %10.2e   %s  (repeat %s, all / none resident: "
                         "max diff / max |out| %.1e; %.2f ms)\n",

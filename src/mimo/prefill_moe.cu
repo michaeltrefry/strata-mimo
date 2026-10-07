@@ -1,7 +1,7 @@
 // src/mimo/prefill_moe.cu - see include/strata/mimo/prefill_moe.hpp.
 //
 // Kernels here: the pick histogram, the stable placement of the picks in processing order, the two MXFP4 -> Q8_0
-// converters (from the GGUF layout and from the decoder's slot layout) and the weighted combine.  The products are
+// converters (from the GGUF layout and from the decoder's slot layout) and the weighted, ordered add into `out`.  The products are
 // llama.cpp's MMQ through strata::prefill::mmq (src/prefill/moe_mmq.cu, the Q8_0 instance).
 #include "strata/mimo/prefill_moe.hpp"
 
@@ -189,18 +189,21 @@ __global__ void hist_kernel(const int32_t* __restrict__ ids, int n, int32_t* __r
         if (h[i]) atomicAdd(&counts[i], h[i]);
 }
 
-// Block e: expert e's picks, in pick order, to rows bounds[rank[e]] ...; row_tok[row] = the pick's token,
-// pos[pick] = its row.  plan = rank[256] | bounds[...].
-__global__ void place_kernel(const int32_t* __restrict__ ids, int n, int k, const int32_t* __restrict__ plan,
-                             int32_t* __restrict__ row_tok, int32_t* __restrict__ pos) {
+// Block e: expert e's picks, in pick order, to rows bounds[rank[e]] ...: row_tok[row] = the pick's token, row_w[row]
+// = its router weight.  plan = rank[256] | bounds[...].
+constexpr int kPlaceThreads = 1024;
+__global__ void __launch_bounds__(kPlaceThreads) place_kernel(const int32_t* __restrict__ ids, const float* __restrict__ w,
+                                                              int n, int k, const int32_t* __restrict__ plan,
+                                                              int32_t* __restrict__ row_tok, float* __restrict__ row_w) {
     const int e = blockIdx.x;
     const int r = plan[e];
     if (r < 0) return;
     const int base = plan[kNExpert + r];
-    __shared__ int warp_n[8];
+    constexpr int kWarps = kPlaceThreads / 32;
+    __shared__ int warp_n[kWarps];
     const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
     int running = 0;
-    for (int i0 = 0; i0 < n; i0 += 256) {
+    for (int i0 = 0; i0 < n; i0 += kPlaceThreads) {
         const int i = i0 + threadIdx.x;
         const bool f = i < n && ids[i] == e;
         const unsigned m = __ballot_sync(0xffffffffu, f);
@@ -208,67 +211,67 @@ __global__ void place_kernel(const int32_t* __restrict__ ids, int n, int k, cons
         __syncthreads();
         int before = 0, total = 0;
 #pragma unroll
-        for (int w = 0; w < 8; ++w) {
-            before += w < wid ? warp_n[w] : 0;
-            total += warp_n[w];
+        for (int q = 0; q < kWarps; ++q) {
+            before += q < wid ? warp_n[q] : 0;
+            total += warp_n[q];
         }
         if (f) {
             const int row = base + running + before + __popc(m & ((1u << lane) - 1));
             row_tok[row] = i / k;
-            pos[i] = row;
+            row_w[row] = w[i];
         }
         running += total;
         __syncthreads();
     }
 }
 
-// out[t] = sum_j w[t][j] * rows[pos[t][j]], j in pick order
-__global__ void combine_kernel(const float* __restrict__ rows, const int32_t* __restrict__ pos,
-                               const float* __restrict__ w, int k, float* __restrict__ out) {
-    const int t = blockIdx.x;
-    float4 acc[kE / (4 * 256)];
+// out[row_tok[i]] += row_w[i] * rows[i] for the rows of ONE expert (its tokens are distinct: no two blocks write the
+// same output row).  Launched per expert in the processing order, so every output row sums in a fixed order.
+__global__ void add_rows_kernel(const float* __restrict__ rows, const int32_t* __restrict__ row_tok,
+                                const float* __restrict__ row_w, float* __restrict__ out) {
+    const int i = blockIdx.x;
+    const float wt = row_w[i];
+    const float4* r = (const float4*) (rows + (size_t) i * kE);
+    float4* o = (float4*) (out + (size_t) row_tok[i] * kE);
 #pragma unroll
-    for (int c = 0; c < kE / (4 * 256); ++c) acc[c] = make_float4(0, 0, 0, 0);
-    for (int j = 0; j < k; ++j) {
-        const int p = pos[t * k + j];
-        if (p < 0) continue;
-        const float wt = w[t * k + j];
-        const float4* r = (const float4*) (rows + (size_t) p * kE);
-#pragma unroll
-        for (int c = 0; c < kE / (4 * 256); ++c) {
-            const float4 v = r[c * 256 + threadIdx.x];
-            acc[c].x += wt * v.x;
-            acc[c].y += wt * v.y;
-            acc[c].z += wt * v.z;
-            acc[c].w += wt * v.w;
-        }
+    for (int c = 0; c < kE / (4 * 256); ++c) {
+        const float4 v = r[c * 256 + threadIdx.x];
+        float4 a = o[c * 256 + threadIdx.x];
+        a.x += wt * v.x;
+        a.y += wt * v.y;
+        a.z += wt * v.z;
+        a.w += wt * v.w;
+        o[c * 256 + threadIdx.x] = a;
     }
-    float4* o = (float4*) (out + (size_t) t * kE);
-#pragma unroll
-    for (int c = 0; c < kE / (4 * 256); ++c) o[c * 256 + threadIdx.x] = acc[c];
 }
 
 size_t align_up(size_t n, size_t a = 4096) { return (n + a - 1) / a * a; }
 
+int max_tiles(const PrefillMoeConfig& c) {   // groups (<= 256 / smallest group + 2) + tile boundaries inside them
+    return kNExpert / std::max(1, std::min(c.group, c.group_ram)) + 2 +
+           (int) ((long long) c.max_tokens * c.k / std::max(1, c.tile_rows)) + 1;
+}
+size_t plan_ints(const PrefillMoeConfig& c) { return (size_t) (2 * kNExpert + 1) + kNExpert + 2 * (size_t) max_tiles(c); }
+
 struct Layout {
-    size_t staging, gu_q8, d_q8, xq, hq, gu, h, counts, row_tok, pos, iota, plan, total;
+    size_t staging, gu_q8, d_q8, xq, hq, gu, h, iota, counts, row_tok, row_w, plan, total;
     Layout(const PrefillMoeConfig& c) {
-        const size_t rows = (size_t) c.max_tokens * c.k;
+        const size_t rows = (size_t) c.max_tokens * c.k, tile = (size_t) c.tile_rows;
         const size_t g = (size_t) std::max(c.group, c.group_ram);
         size_t o = 0;
         auto take = [&](size_t bytes) { const size_t at = o; o += align_up(bytes); return at; };
         staging = take((size_t) c.staging * kMxSlotBytes);
         gu_q8 = take(g * kPfGuQ8Bytes);
         d_q8 = take(g * kPfDownQ8Bytes);
-        xq = take(mmq::q8_bytes((int64_t) rows, kE));
-        hq = take(mmq::q8_bytes((int64_t) rows, kF));
-        gu = take(rows * kE * sizeof(float));
-        h = take(rows * kF * sizeof(float));
+        xq = take(mmq::q8_bytes((int64_t) tile, kE));     // per tile
+        hq = take(mmq::q8_bytes((int64_t) tile, kF));
+        gu = take(tile * kE * sizeof(float));
+        h = take(tile * kF * sizeof(float));
+        iota = take(tile * 4);
         counts = take(kNExpert * 4);
-        row_tok = take(rows * 4);
-        pos = take(rows * 4);
-        iota = take(rows * 4);
-        plan = take((size_t) (3 * kNExpert + 2) * 4 + 2 * kNExpert * 4);
+        row_tok = take(rows * 4);                         // per pick: 8 bytes
+        row_w = take(rows * 4);
+        plan = take(plan_ints(c) * 4);
         total = o;
     }
 };
@@ -306,10 +309,27 @@ PrefillMoe::~PrefillMoe() {
     delete (mmq::Context*) mmq_;
 }
 
-size_t PrefillMoe::device_bytes() const { return Layout(cfg_).total; }
+size_t PrefillMoe::device_bytes(const PrefillMoeConfig& c) { return Layout(c).total; }
 
 bool PrefillMoe::init(std::string& err) {
-    if (cfg_.max_tokens < 1 || cfg_.k < 1 || cfg_.k > 64 || cfg_.group < 1 || cfg_.group_ram < 1 || cfg_.staging < 1) {
+    if (cfg_.vram_mib > 0) {   // the largest tile (a multiple of 512 rows) that fits the budget
+        PrefillMoeConfig c = cfg_;
+        c.tile_rows = 512;
+        if (Layout(c).total > ((size_t) cfg_.vram_mib << 20)) {
+            err = "prefill moe: " + std::to_string(cfg_.vram_mib) + " MiB is less than the smallest layout (" +
+                  std::to_string(Layout(c).total >> 20) + " MiB)";
+            return false;
+        }
+        while (c.tile_rows < cfg_.max_tokens * cfg_.k) {
+            PrefillMoeConfig d = c;
+            d.tile_rows += 512;
+            if (Layout(d).total > ((size_t) cfg_.vram_mib << 20)) break;
+            c = d;
+        }
+        cfg_.tile_rows = c.tile_rows;
+    }
+    if (cfg_.max_tokens < 1 || cfg_.k < 1 || cfg_.k > 64 || cfg_.group < 1 || cfg_.group_ram < 1 || cfg_.staging < 1 ||
+        cfg_.tile_rows < 1) {
         err = "prefill moe: bad config";
         return false;
     }
@@ -340,11 +360,10 @@ bool PrefillMoe::init(std::string& err) {
     h_ = (float*) (dev_ + L.h);
     counts_ = (int32_t*) (dev_ + L.counts);
     row_tok_ = (int32_t*) (dev_ + L.row_tok);
-    pos_ = (int32_t*) (dev_ + L.pos);
+    row_w_ = (float*) (dev_ + L.row_w);
     iota_ = (int32_t*) (dev_ + L.iota);
     plan_ = (int32_t*) (dev_ + L.plan);
-    if (cudaMallocHost(&h_counts_, kNExpert * 4) != cudaSuccess ||
-        cudaMallocHost(&h_plan_, (size_t) (3 * kNExpert + 2) * 4 + 2 * kNExpert * 4) != cudaSuccess ||
+    if (cudaMallocHost(&h_counts_, kNExpert * 4) != cudaSuccess || cudaMallocHost(&h_plan_, plan_ints(cfg_) * 4) != cudaSuccess ||
         cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking) != cudaSuccess) {
         (void) cudaGetLastError();
         err = "prefill moe: pinned buffers / copy stream";
@@ -358,7 +377,7 @@ bool PrefillMoe::init(std::string& err) {
     }
     for (cudaEvent_t* e : {&ev_start_, &ev_counts_, &ev_plan_, &ev_copy0_, &ev_copy1_, &ev_end_}) cudaEventCreate(e);
     mmq_ = new mmq::Context();
-    mmq::iota(iota_, (int64_t) cfg_.max_tokens * cfg_.k, nullptr);
+    mmq::iota(iota_, cfg_.tile_rows, nullptr);
     if (cudaDeviceSynchronize() != cudaSuccess) {
         err = std::string("prefill moe: init: ") + cudaGetErrorString(cudaGetLastError());
         return false;
@@ -387,13 +406,14 @@ void PrefillMoe::run_layer(const PrefillMoeLayer& L, cudaStream_t s, Mode mode) 
     cudaEventRecord(ev_start_, s);
     // 1. counts -> host
     cudaMemsetAsync(counts_, 0, kNExpert * 4, s);
-    hist_kernel<<<std::min(64u, blocks_for(n, 1024)), 256, 0, s>>>(L.ids, n, counts_);
+    hist_kernel<<<std::min(256u, blocks_for(n, 1024)), 256, 0, s>>>(L.ids, n, counts_);
     check("hist");
     cudaMemcpyAsync(h_counts_, counts_, kNExpert * 4, cudaMemcpyDeviceToHost, s);
     cudaEventRecord(ev_counts_, s);
     cudaEventSynchronize(ev_counts_);
 
-    // the plan: resident experts first, then the copied ones, each in expert order
+    // the plan: resident experts first, then the copied ones, each in expert order; groups of experts (one conversion
+    // each); tiles of at most tile_rows rows within a group (an expert's rows may span tiles)
     std::vector<int> order_res, order_ram;
     for (int e = 0; e < kNExpert; ++e) {
         if (h_counts_[e] == 0) continue;
@@ -404,32 +424,46 @@ void PrefillMoe::run_layer(const PrefillMoeLayer& L, cudaStream_t s, Mode mode) 
     const int n_used = (int) order.size(), n_res = (int) order_res.size();
     int32_t* rank = h_plan_;
     int32_t* bounds = h_plan_ + kNExpert;
-    int32_t* relb = bounds + kNExpert + 1;   // per group: its experts' bounds relative to the group's first row
+    int32_t* relb = bounds + kNExpert + 1;   // per tile: its experts' row ranges relative to the tile's first row
     for (int e = 0; e < kNExpert; ++e) rank[e] = -1;
     bounds[0] = 0;
     for (int i = 0; i < n_used; ++i) {
         rank[order[(size_t) i]] = i;
         bounds[i + 1] = bounds[i] + h_counts_[order[(size_t) i]];
     }
-    struct Group { int first, n, rel; };   // experts [first, first + n) of `order`; relb offset
+    struct Tile { int a, b, q0, nq, rel, max_rows; };   // rows [a, b); experts order[q0 .. q0 + nq)
+    struct Group { int first, n, t0, nt; };            // experts [first, first + n); tiles [t0, t0 + nt)
     std::vector<Group> groups;
+    std::vector<Tile> tiles;
     int rel_n = 0;
     for (int part = 0; part < 2; ++part) {
         const int lo = part ? n_res : 0, hi = part ? n_used : n_res, g = part ? cfg_.group_ram : cfg_.group;
         for (int f = lo; f < hi; f += g) {
-            const Group gr{f, std::min(g, hi - f), rel_n};
-            for (int j = 0; j <= gr.n; ++j) relb[rel_n++] = bounds[f + j] - bounds[f];
+            Group gr{f, std::min(g, hi - f), (int) tiles.size(), 0};
+            int q = f;
+            for (int a = bounds[f]; a < bounds[f + gr.n]; a += cfg_.tile_rows) {
+                const int b = std::min(a + cfg_.tile_rows, bounds[f + gr.n]);
+                while (bounds[q + 1] <= a) ++q;
+                Tile t{a, b, q, 0, rel_n, 0};
+                for (int j = q; j < f + gr.n && bounds[j] < b; ++j) {
+                    const int sa = std::max(bounds[j], a), sb = std::min(bounds[j + 1], b);
+                    relb[rel_n++] = sa - a;
+                    t.max_rows = std::max(t.max_rows, sb - sa);
+                    ++t.nq;
+                }
+                relb[rel_n++] = b - a;
+                tiles.push_back(t);
+                ++gr.nt;
+            }
             groups.push_back(gr);
         }
     }
-    const int rows = bounds[n_used];
     const size_t plan_bytes = (size_t) (2 * kNExpert + 1 + rel_n) * 4;
     cudaMemcpyAsync(plan_, h_plan_, plan_bytes, cudaMemcpyHostToDevice, s);
-    // 2. picks in that order, x rows in that order as q8_1
-    cudaMemsetAsync(pos_, 0xff, (size_t) n * 4, s);
-    place_kernel<<<kNExpert, 256, 0, s>>>(L.ids, n, K, plan_, row_tok_, pos_);
+    // 2. picks in that order
+    place_kernel<<<kNExpert, kPlaceThreads, 0, s>>>(L.ids, L.w, n, K, plan_, row_tok_, row_w_);
     check("place");
-    if (mode != Mode::copy_only && rows > 0) mmq::quantize(L.x, row_tok_, xq_, kTypeQ8, kE, kE, rows, s);
+    if (mode != Mode::copy_only) cudaMemsetAsync(L.out, 0, (size_t) P * kE * sizeof(float), s);
     cudaEventRecord(ev_plan_, s);
 
     // 3. the copies (ring of staging buffers), conversions and products
@@ -450,9 +484,7 @@ void PrefillMoe::run_layer(const PrefillMoeLayer& L, cudaStream_t s, Mode mode) 
         cudaEventRecord(arrived_[b], copy_);
         if (i == n_ram - 1) cudaEventRecord(ev_copy1_, copy_);
     };
-    if (n_ram > 0) {
-        for (int i = 0; i < std::min(cfg_.staging, n_ram); ++i) issue_copy(i);
-    }
+    for (int i = 0; i < std::min(cfg_.staging, n_ram); ++i) issue_copy(i);
     // The compute stream's order: the resident groups spread over the waits for the copied ones, all of them before
     // the last copied group (so the copy ring keeps moving, and after the last copy only one group is left).
     const int n_rg = (int) (std::lower_bound(groups.begin(), groups.end(), n_res,
@@ -468,10 +500,8 @@ void PrefillMoe::run_layer(const PrefillMoeLayer& L, cudaStream_t s, Mode mode) 
     auto* ctx = (mmq::Context*) mmq_;
     for (const int gi : schedule) {
         const Group& g = groups[(size_t) gi];
-        int max_rows = 0;
         for (int j = 0; j < g.n; ++j) {
             const int q = g.first + j, e = order[(size_t) q];
-            max_rows = std::max(max_rows, h_counts_[e]);
             uint8_t* gq = gu_q8_ + (size_t) j * kPfGuQ8Bytes;
             uint8_t* dq = d_q8_ + (size_t) j * kPfDownQ8Bytes;
             if (q < n_res) {
@@ -486,51 +516,50 @@ void PrefillMoe::run_layer(const PrefillMoeLayer& L, cudaStream_t s, Mode mode) 
             }
         }
         if (mode == Mode::copy_only) continue;
-        const int r0 = bounds[g.first], gr = bounds[g.first + g.n] - r0;
-        mmq::Product gu;
-        gu.w = gu_q8_;
-        gu.type = kTypeQ8;
-        gu.w_rows = 2 * kF;
-        gu.w_cols = kE;
-        gu.expert_bytes = kPfGuQ8Bytes;
-        gu.n = g.n;
-        gu.xq = xq_;
-        gu.bounds = plan_ + kNExpert + g.first;
-        gu.ids = iota_;
-        gu.total_rows = rows;
-        gu.max_rows = max_rows;
-        gu.dst = gu_;
-        gu.ld_dst = kE;
-        ctx->run(gu, s);
-        mmq::swiglu(gu_ + (size_t) r0 * kE, h_, gr, kF, false, s);
-        mmq::quantize(h_, nullptr, hq_, kTypeQ8, kF, kF, gr, s);
-        mmq::Product dn;
-        dn.w = d_q8_;
-        dn.type = kTypeQ8;
-        dn.w_rows = kE;
-        dn.w_cols = kF;
-        dn.expert_bytes = kPfDownQ8Bytes;
-        dn.n = g.n;
-        dn.xq = hq_;
-        dn.bounds = plan_ + 2 * kNExpert + 1 + g.rel;
-        dn.ids = iota_ + r0;
-        dn.total_rows = gr;
-        dn.max_rows = max_rows;
-        dn.dst = gu_;   // the same rows as this group's gate|up products, which swiglu has consumed
-        dn.ld_dst = kE;
-        ctx->run(dn, s);
+        for (int ti = g.t0; ti < g.t0 + g.nt; ++ti) {
+            const Tile& t = tiles[(size_t) ti];
+            const int rows = t.b - t.a, j0 = t.q0 - g.first;
+            mmq::quantize(L.x, row_tok_ + t.a, xq_, kTypeQ8, kE, kE, rows, s);   // the tile's x rows, gathered
+            mmq::Product gu;
+            gu.w = gu_q8_ + (size_t) j0 * kPfGuQ8Bytes;
+            gu.type = kTypeQ8;
+            gu.w_rows = 2 * kF;
+            gu.w_cols = kE;
+            gu.expert_bytes = kPfGuQ8Bytes;
+            gu.n = t.nq;
+            gu.xq = xq_;
+            gu.bounds = plan_ + 2 * kNExpert + 1 + t.rel;
+            gu.ids = iota_;
+            gu.total_rows = rows;
+            gu.max_rows = t.max_rows;
+            gu.dst = gu_;
+            gu.ld_dst = kE;
+            ctx->run(gu, s);
+            mmq::swiglu(gu_, h_, rows, kF, false, s);
+            mmq::quantize(h_, nullptr, hq_, kTypeQ8, kF, kF, rows, s);
+            mmq::Product dn = gu;
+            dn.w = d_q8_ + (size_t) j0 * kPfDownQ8Bytes;
+            dn.w_rows = kE;
+            dn.w_cols = kF;
+            dn.expert_bytes = kPfDownQ8Bytes;
+            dn.xq = hq_;
+            dn.dst = gu_;   // the tile's gate|up rows, which swiglu has consumed
+            ctx->run(dn, s);
+            // 4. weighted into `out`, one expert after the other (a fixed order for every output row)
+            for (int j = 0; j < t.nq; ++j) {
+                const int sa = std::max(bounds[t.q0 + j], t.a), sb = std::min(bounds[t.q0 + j + 1], t.b);
+                add_rows_kernel<<<sb - sa, 256, 0, s>>>(gu_ + (size_t) (sa - t.a) * kE, row_tok_ + sa, row_w_ + sa, L.out);
+            }
+            check("add_rows");
+        }
     }
     ring_ += (unsigned long long) n_ram;
-    // 4. the weighted sum per token
-    if (mode != Mode::copy_only) {
-        combine_kernel<<<P, 256, 0, s>>>(gu_, pos_, L.w, K, L.out);
-        check("combine");
-    }
     cudaEventRecord(ev_end_, s);
     times_ = PrefillMoeTimes{};
     times_.used = n_used;
     times_.resident = n_res;
     times_.copied = n_ram;
+    times_.tiles = (int) tiles.size();
     times_.copied_bytes = mode == Mode::compute_only ? 0 : (size_t) n_ram * L.ram.expert_bytes();
 }
 
