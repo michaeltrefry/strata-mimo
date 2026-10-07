@@ -1,20 +1,23 @@
-// include/strata/mimo/prefill_moe.hpp - MiMo's routed experts for a prompt chunk: P tokens (1..4096) x top-8 of one
-// MoE layer, out[t] = sum over the 8 picks of w * down(silu(gate x) * up x).
+// include/strata/mimo/prefill_moe.hpp - MiMo's routed experts for a slice of the prompt: S tokens (1..max_tokens,
+// e.g. 32,768 for a layer-major prompt driver) x top-8 of one MoE layer, out[t] = sum over the 8 picks of
+// w * down(silu(gate x) * up x).  Every expert is read (and, if not resident, copied over PCIe) at most once per call;
+// the device memory does not grow with S beyond 8 bytes per pick.
 //
 // Per layer (run_layer):
-//   1. group by expert on the device: a histogram of the P*8 picks; the counts go to the host (the one host sync per
+//   1. group by expert on the device: a histogram of the S*8 picks; the counts go to the host (the one host sync per
 //      layer), which orders the used experts (resident ones first, then the ones in RAM), and a stable placement
 //      kernel lays the picks out in that order (deterministic: no atomics decide an order)
 //   2. the used experts that are not resident are copied from RAM (GGUF layout, gate | up | down, 13.4 MB) into a
 //      ring of device staging buffers on a second stream, while the GPU computes the resident ones (events between
 //      the two streams; the ring carries over from one layer to the next)
-//   3. every expert is converted on the device into Q8_0 (from its VRAM slot or from the staging buffer).  MXFP4 to
-//      Q8_0 is exact: a block's 32 values are kvalues_mxfp4 (integers -12..12) times 2^(e - 128), which is a Q8_0
-//      block with d = 2^(e - 128) as fp16 (exact for e in 104..143; outside that the block is rounded, see
-//      docs/MIMO_PREFILL_MOE.md for how often that happens: never in the model's experts)
-//   4. llama.cpp's Q8_0 MMQ (int8 tensor cores, activations as q8_1) for gate|up of a group of experts in one
-//      launch, SiLU * up, h to q8_1, down, into one F32 row per pick; then a combine kernel sums each token's 8
-//      rows times their weights in pick order (no atomics: the same input gives the same bits)
+//   3. every expert is converted on the device into Q8_0 once (from its VRAM slot or from the staging buffer), in
+//      groups of experts.  MXFP4 to Q8_0 is exact: a block's 32 values are kvalues_mxfp4 (integers -12..12) times
+//      2^(e - 128), which is a Q8_0 block with d = 2^(e - 128) as fp16 (exact for e in 104..143; outside that the block
+//      is rounded - never in the model's experts, docs/MIMO_PREFILL_MOE.md)
+//   4. a group's rows are processed in tiles of at most tile_rows rows (an expert's rows may span tiles): the tile's
+//      x rows gathered and quantized to q8_1, llama.cpp's Q8_0 MMQ for gate|up of the tile's experts in one launch,
+//      SiLU * up, h to q8_1, down; then each expert's rows are added, times their weights, into `out` - one launch per
+//      expert in the processing order, so every output row sums in a fixed order (the same input gives the same bits)
 //
 // Why Q8_0 and not ggml's MXFP4 MMQ: on sm_120 that kernel quantizes the activations to FP4 (block_fp4_mmq) for the
 // native FP4 MMA, and FP4 activations are far coarser than q8_1 (docs/MIMO_PREFILL_MOE.md).  The Q8_0 conversion
@@ -33,24 +36,26 @@
 namespace strata::mimo {
 
 struct PrefillMoeConfig {
-    int max_tokens = 4096;   // P per call
+    int max_tokens = 32768;  // S per call (costs 8 bytes of VRAM per pick: 2 MiB at 32,768)
     int k = 8;               // picks per token (n_expert_used)
-    int group = 16;          // resident experts per MMQ launch
-    int group_ram = 8;       // copied experts per MMQ launch (smaller: the last group after the last copy is the tail)
+    int group = 16;          // resident experts per conversion group
+    int group_ram = 8;       // copied experts per group (smaller: the last group after the last copy is the tail)
     int staging = 16;        // device buffers for experts in flight from RAM (13.4 MB each)
+    int tile_rows = 4096;    // picks per product tile (31.5 KiB of VRAM each; 4K..32K ran within 4%)
+    int vram_mib = 0;        // > 0: choose tile_rows (a multiple of 512) as large as fits this total
 };
 
 /// What one layer's call needs.  Device pointers unless said otherwise.
 struct PrefillMoeLayer {
-    int n_tok = 0;                               // P, 1..max_tokens
-    const float* x = nullptr;                    // [P][4096] the ffn_norm output
-    const int32_t* ids = nullptr;                // [P][k] the router's picks (expert ids; < 0 = none)
-    const float* w = nullptr;                    // [P][k] their weights
-    float* out = nullptr;                        // [P][4096] overwritten with the weighted sums
+    int n_tok = 0;                               // S, 1..max_tokens
+    const float* x = nullptr;                    // [S][4096] the ffn_norm output
+    const int32_t* ids = nullptr;                // [S][k] the router's picks (expert ids, distinct per token; < 0 = none)
+    const float* w = nullptr;                    // [S][k] their weights
+    float* out = nullptr;                        // [S][4096] overwritten with the weighted sums
     const int32_t* resident = nullptr;           // HOST [256]: expert -> VRAM slot, -1 = only in RAM
     const unsigned long long* slot_addr = nullptr;   // HOST: slot -> device address of the slot (expert_mxfp4.hpp format)
     ExpertSlices ram;                            // HOST: the layer's experts in GGUF layout (CpuExperts::source(l) or
-                                                 // the model's mapping); pinned (register_host) for full PCIe speed
+                                                 // the model's mapping); pinned for full PCIe speed
 };
 
 /// Timings of the last call (milliseconds, from CUDA events; times() waits for the call to finish).
@@ -60,6 +65,7 @@ struct PrefillMoeTimes {
     float copy = 0;       // first copy started -> last copy done (the copy stream's span; 0 when nothing was copied)
     float tail = 0;       // last copy done -> `out` written
     int used = 0, resident = 0, copied = 0;      // experts with picks; of them resident; copied from RAM
+    int tiles = 0;                               // product tiles
     size_t copied_bytes = 0;
 };
 
@@ -74,15 +80,19 @@ public:
     PrefillMoe(const PrefillMoe&) = delete;
     PrefillMoe& operator=(const PrefillMoe&) = delete;
 
-    /// Allocates the device buffers (device_bytes(), a few large allocations) and the copy stream.  Refuses when the
-    /// GPU has less free memory than that plus 256 MiB (on Windows an allocation past the free VRAM lands in system
-    /// memory instead of failing).  False with `err` on failure.
+    /// Allocates the device buffers (one cudaMalloc) and the copy stream.  Refuses when the GPU has less free memory
+    /// than that plus 256 MiB (on Windows an allocation past the free VRAM lands in system memory instead of
+    /// failing).  False with `err` on failure.
     bool init(std::string& err);
-    size_t device_bytes() const;
+    /// VRAM of a configuration (with tile_rows as given), and of this object after init.
+    static size_t device_bytes(const PrefillMoeConfig& cfg);
+    size_t device_bytes() const { return dev_bytes_ ? dev_bytes_ : device_bytes(cfg_); }
+    const PrefillMoeConfig& config() const { return cfg_; }   // tile_rows as chosen by init
 
     /// One MoE layer.  Enqueued on `stream` (and the internal copy stream); the host waits once, for the routing
     /// counts, then returns with the work in flight: `out` is ready when `stream` reaches it.  Inputs must stay
-    /// valid until then; the host tables (`resident`, `slot_addr`, `ram`) are read before it returns.
+    /// valid until then; the host tables (`resident`, `slot_addr`, `ram`) are read before it returns.  Consecutive
+    /// calls must use the same stream.
     void run_layer(const PrefillMoeLayer& layer, cudaStream_t stream, Mode mode = Mode::full);
     PrefillMoeTimes times();
 
@@ -97,13 +107,14 @@ private:
     uint8_t* staging_ = nullptr;      // [staging][13,369,344] raw experts
     uint8_t* gu_q8_ = nullptr;        // [max(group, group_ram)][4096 rows x 4096] Q8_0 gate|up
     uint8_t* d_q8_ = nullptr;         // [..][4096 rows x 2048] Q8_0 down
-    void* xq_ = nullptr;              // x rows in pick order, q8_1 (MMQ layout)
-    void* hq_ = nullptr;              // a group's h, q8_1
-    float* gu_ = nullptr;             // [P*k][4096] gate|up products, then the down products (same rows)
-    float* h_ = nullptr;              // [rows of a group][2048]
-    int32_t *counts_ = nullptr, *row_tok_ = nullptr, *pos_ = nullptr, *iota_ = nullptr, *plan_ = nullptr;
+    void* xq_ = nullptr;              // a tile's x rows, q8_1 (MMQ layout)
+    void* hq_ = nullptr;              // a tile's h, q8_1
+    float* gu_ = nullptr;             // [tile_rows][4096] gate|up products, then the down products (same rows)
+    float* h_ = nullptr;              // [tile_rows][2048]
+    int32_t *counts_ = nullptr, *row_tok_ = nullptr, *iota_ = nullptr, *plan_ = nullptr;
+    float* row_w_ = nullptr;          // [S*k] the router weight of each placed pick
     int32_t* h_counts_ = nullptr;     // pinned
-    int32_t* h_plan_ = nullptr;       // pinned: rank[256] | bounds[n+1] | per group: relative bounds
+    int32_t* h_plan_ = nullptr;       // pinned: rank[256] | bounds[n+1] | per tile: relative bounds
     cudaStream_t copy_ = nullptr;
     cudaEvent_t *arrived_ = nullptr, *freed_ = nullptr;
     cudaEvent_t ev_start_ = nullptr, ev_counts_ = nullptr, ev_plan_ = nullptr, ev_copy0_ = nullptr,
