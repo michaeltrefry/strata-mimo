@@ -73,6 +73,9 @@ MimoDecoder::~MimoDecoder() {
         if (ge) cudaGraphExecDestroy(ge);
     for (auto& ge : mtp_graphs_)
         if (ge) cudaGraphExecDestroy(ge);
+    if (copy_stream_) cudaStreamSynchronize(copy_stream_);
+    for (auto& sw : in_flight_) cudaEventDestroy(sw.done);
+    if (copy_stream_) cudaStreamDestroy(copy_stream_);
     attn_kv_free(mtp_kv_);
     attn_prompt_scratch_free(aps_);
     pmoe_.reset();
@@ -201,8 +204,12 @@ bool MimoDecoder::init(std::string& err) {
             if (g.is_moe(l)) pick.emplace_back(l, e);
         }
     }
+    // spare slots for decode-time residency: taken from the budget, filled as experts move in
+    const int n_spare = cfg_.adapt_decode && cfg_.cpu_experts && cfg_.graph && !pick.empty()
+                            ? std::min(cfg_.adapt_spares, (int) pick.size() / 2) : 0;
+    pick.resize(pick.size() - (size_t) n_spare);
     n_resident_ = (int) pick.size();
-    const int n_slots = n_resident_ + n_staging_;
+    const int n_slots = n_resident_ + n_spare + n_staging_;
     slot_addr_.resize((size_t) n_slots);
     // slots in chunks of 64 (816 MiB): a slot on its own would be rounded up to whole 2 MiB pages (14 MiB for 12.75),
     // and on Windows the overshoot does not fail - it lands in system memory and those experts run at PCIe speed
@@ -227,6 +234,14 @@ bool MimoDecoder::init(std::string& err) {
         mxfp4_slot_relayout(raw_, (void*) slot_addr_[(size_t) i], stream_);
         if (!cuda_ok(cudaStreamSynchronize(stream_), "expert relayout", err)) return false;
         resident_[(size_t) l][(size_t) e] = i;
+    }
+    // decode-time residency: the spare slots, a copy stream and its buffer, the recent counts
+    for (int i = 0; i < n_spare; ++i) spares_.push_back(n_resident_ + i);
+    if (n_spare > 0 && !profile_score_.empty()) {
+        if (!cuda_ok(cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking), "copy stream", err) ||
+            !dev(kMxSlotBytes, &raw_copy_))
+            return false;
+        recent_.assign((size_t) g.n_layer * g.n_expert, 0.f);
     }
     // the residency table on the device (v2 builds each layer's slot list there)
     if (!dev(sizeof(int32_t) * (size_t) g.n_layer * g.n_expert, &d_res_)) return false;
@@ -400,6 +415,102 @@ bool MimoDecoder::prompt(const int32_t* tokens, int n, int pos0, const ChooseFn&
     return true;
 }
 
+void MimoDecoder::adapt_count(int l, const int32_t* ids, int n) {
+    if (recent_.empty()) return;
+    const int ne = model_.geometry().n_expert;
+    const float add = 1.f / recent_scale_;   // lazy decay: counts are stored divided by the running scale
+    for (int i = 0; i < n; ++i)
+        if (ids[i] >= 0 && ids[i] < ne) recent_[(size_t) l * ne + ids[i]] += add;
+}
+
+// After a window (no graph in flight): commit the background copies that have finished, decay the recent counts,
+// and every adapt_interval windows start copies of the best non-resident experts into the spare slots.
+bool MimoDecoder::adapt_window(int T, std::string& err) {
+    const MimoGeometry& g = model_.geometry();
+    const int ne = g.n_expert;
+    // commits: the copy is in its slot; the expert it replaces gives up its slot as the next spare
+    for (size_t i = 0; i < in_flight_.size();) {
+        Swap& sw = in_flight_[i];
+        if (cudaEventQuery(sw.done) != cudaSuccess) { ++i; continue; }
+        // the victim: the lowest-scoring resident expert now (scores may have moved since the copy started)
+        const float a = cfg_.adapt_recent_weight;
+        double tot_v = 0;
+        int vl = -1, ve = -1;
+        float vs = 1e30f;
+        std::vector<double> tot((size_t) g.n_layer, 0.0);
+        for (int l = 0; l < g.n_layer; ++l)
+            for (int e = 0; e < ne; ++e) tot[(size_t) l] += recent_[(size_t) l * ne + e];
+        for (int l = 0; l < g.n_layer; ++l) {
+            if (!g.is_moe(l)) continue;
+            for (int e = 0; e < ne; ++e) {
+                if (resident_[(size_t) l][(size_t) e] < 0) continue;
+                const float sc = (1.f - a) * profile_score_[(size_t) l * ne + e] +
+                                 a * (tot[(size_t) l] > 0 ? (float) (recent_[(size_t) l * ne + e] / tot[(size_t) l]) : 0.f);
+                if (sc < vs) { vs = sc; vl = l; ve = e; }
+            }
+        }
+        (void) tot_v;
+        int32_t upd[2] = {sw.slot, -1};
+        resident_[(size_t) sw.layer][(size_t) sw.expert] = sw.slot;
+        cudaMemcpyAsync(d_res_ + (size_t) sw.layer * ne + sw.expert, &upd[0], 4, cudaMemcpyHostToDevice, stream_);
+        if (vl >= 0) {
+            spares_.push_back(resident_[(size_t) vl][(size_t) ve]);
+            resident_[(size_t) vl][(size_t) ve] = -1;
+            cudaMemcpyAsync(d_res_ + (size_t) vl * ne + ve, &upd[1], 4, cudaMemcpyHostToDevice, stream_);
+        }
+        if (!cuda_ok(cudaStreamSynchronize(stream_), "residency commit", err)) return false;   // upd is on the stack
+        cudaEventDestroy(sw.done);
+        in_flight_.erase(in_flight_.begin() + (std::ptrdiff_t) i);
+        ++stats_.swapped;
+    }
+    // decay: half-life adapt_half_life tokens
+    recent_scale_ *= std::pow(0.5f, (float) T / cfg_.adapt_half_life);
+    if (recent_scale_ < 1e-12f) {   // fold the scale into the counts before it underflows
+        for (float& v : recent_) v *= recent_scale_;
+        recent_scale_ = 1.f;
+    }
+    if (++windows_since_adapt_ < cfg_.adapt_interval || spares_.empty()) return true;
+    windows_since_adapt_ = 0;
+    // scores of every MoE expert; the best non-resident ones that beat the worst resident ones by adapt_margin
+    const float a = cfg_.adapt_recent_weight;
+    std::vector<std::pair<float, int>> cand, res;
+    for (int l = 0; l < g.n_layer; ++l) {
+        if (!g.is_moe(l)) continue;
+        double tot = 0;
+        for (int e = 0; e < ne; ++e) tot += recent_[(size_t) l * ne + e];
+        for (int e = 0; e < ne; ++e) {
+            const float sc = (1.f - a) * profile_score_[(size_t) l * ne + e] +
+                             a * (tot > 0 ? (float) (recent_[(size_t) l * ne + e] / tot) : 0.f);
+            bool moving = false;
+            for (const Swap& sw : in_flight_) moving |= sw.layer == l && sw.expert == e;
+            if (moving) continue;
+            (resident_[(size_t) l][(size_t) e] >= 0 ? res : cand).emplace_back(sc, l * ne + e);
+        }
+    }
+    const int n = std::min({(int) spares_.size(), cfg_.adapt_swaps, (int) cand.size(), (int) res.size()});
+    std::partial_sort(cand.begin(), cand.begin() + n, cand.end(), [](auto& x, auto& y) { return x.first > y.first; });
+    std::partial_sort(res.begin(), res.begin() + n, res.end(), [](auto& x, auto& y) { return x.first < y.first; });
+    for (int i = 0; i < n; ++i) {
+        if (cand[(size_t) i].first <= res[(size_t) i].first * cfg_.adapt_margin) break;
+        const int l = cand[(size_t) i].second / ne, e = cand[(size_t) i].second % ne;
+        const int slot = spares_.back();
+        spares_.pop_back();
+        const ExpertSlices& src = cpu_->source(l);   // the pinned RAM copy
+        uint8_t* raw = (uint8_t*) raw_copy_;
+        cudaMemcpyAsync(raw, src.matrix(0, e), src.stride[0], cudaMemcpyHostToDevice, copy_stream_);
+        cudaMemcpyAsync(raw + src.stride[0], src.matrix(1, e), src.stride[1], cudaMemcpyHostToDevice, copy_stream_);
+        cudaMemcpyAsync(raw + src.stride[0] + src.stride[1], src.matrix(2, e), src.stride[2], cudaMemcpyHostToDevice,
+                        copy_stream_);
+        mxfp4_slot_relayout(raw, (void*) slot_addr_[(size_t) slot], copy_stream_);
+        Swap sw{l, e, slot, nullptr};
+        if (!cuda_ok(cudaEventCreateWithFlags(&sw.done, cudaEventDisableTiming), "event", err) ||
+            !cuda_ok(cudaEventRecord(sw.done, copy_stream_), "event", err))
+            return false;
+        in_flight_.push_back(sw);
+    }
+    return true;
+}
+
 void MimoDecoder::release_gpu_waits() {
     if (h_flag_) {
         *(volatile uint32_t*) h_flag_ = UINT32_MAX;   // past every ring: a waiting kernel returns
@@ -512,10 +623,16 @@ bool MimoDecoder::forward_graph(int T, int pos0, int32_t* next, std::string& err
         stats_.wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
         for (int i = 0; i < T * K; ++i) {
             const int e = ((volatile int32_t*) h_ids_)[i];
+            ids[i] = e;
             ++stats_.expert_uses;
             const bool hit = resident_[(size_t) l][(size_t) e] >= 0;
             stats_.expert_hits += hit;
             ids[i] = hit ? -1 : e;
+        }
+        if (!recent_.empty()) {   // the window's picks of this layer, for decode-time residency
+            int32_t picks[kMaxT * kRouterMaxUsed];
+            for (int i = 0; i < T * K; ++i) picks[i] = ((volatile int32_t*) h_ids_)[i];
+            adapt_count(l, picks, T * K);
         }
         const auto c0 = std::chrono::steady_clock::now();
         static const bool skip_cpu = std::getenv("MIMO_SKIP_CPU") != nullptr;   // timing diagnostic: wrong output
@@ -533,6 +650,7 @@ bool MimoDecoder::forward_graph(int T, int pos0, int32_t* next, std::string& err
     }
     cudaMemcpyAsync(next, next_, sizeof(int32_t) * T, cudaMemcpyDeviceToHost, s);
     if (!cuda_ok(cudaStreamSynchronize(s), "window", err)) return false;
+    if (!recent_.empty() && !adapt_window(T, err)) return false;
     if (cfg_.profile_gpu) {
         std::vector<unsigned long long> st((size_t) g.n_layer * 5);
         cudaMemcpy(st.data(), stamps_, st.size() * 8, cudaMemcpyDeviceToHost);

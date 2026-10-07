@@ -45,6 +45,10 @@ int main(int argc, char** argv) {
         else if (a == "--mtp") cfg.mtp_path = argv[i + 1];
         else if (a == "--batched") cfg.batched_prefill = std::atoi(argv[i + 1]) != 0;
         else if (a == "--adapt") cfg.adapt_weight = std::strtof(argv[i + 1], nullptr);
+        else if (a == "--adapt-decode") cfg.adapt_decode = std::atoi(argv[i + 1]) != 0;
+        else if (a == "--adapt-swaps") cfg.adapt_swaps = std::atoi(argv[i + 1]);
+        else if (a == "--adapt-interval") cfg.adapt_interval = std::atoi(argv[i + 1]);
+        else if (a == "--adapt-margin") cfg.adapt_margin = std::strtof(argv[i + 1], nullptr);
         else {
             std::fprintf(stderr, "unknown option %s\n", a.c_str());
             return 2;

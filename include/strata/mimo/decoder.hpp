@@ -45,6 +45,14 @@ struct DecoderConfig {
     int prefill_tile = 2048;        // tokens per attention / dense GEMM tile within a slice
     int adapt_min_prompt = 2048;    // after a batched prompt this long, the resident set follows its routing too
     float adapt_weight = 0.5f;      // the prompt's share in the blended score (the profile has the rest)
+    // residency that follows the generation (v2 only): recent picks decay with this half-life; every
+    // adapt_interval windows up to adapt_swaps hot non-resident experts are copied into spare slots in the
+    // background and replace resident experts scoring at least adapt_margin times lower.  Trickle, not bursts: the
+    // copies share PCIe with the per-layer CPU handoff - 8 swaps every 16 windows cost 30% on a short prompt, 2 per
+    // window cost nothing and gave the most (docs/MIMO_DECODER.md)
+    bool adapt_decode = true;
+    int adapt_spares = 8, adapt_interval = 1, adapt_swaps = 2;
+    float adapt_half_life = 256.f, adapt_recent_weight = 0.5f, adapt_margin = 1.2f;
 };
 
 struct DecoderStats {
@@ -110,6 +118,9 @@ private:
     /// Re-ranks the experts by the profile blended with `counts` (a prompt's picks per layer and expert) and moves
     /// the best non-resident ones into the slots of the worst resident ones.
     bool adapt_residency(const std::vector<std::vector<uint32_t>>& counts, std::string& err);
+    // decode-time residency (v2): the picks of each window, commits of finished background copies, new copies
+    void adapt_count(int l, const int32_t* ids, int n);
+    bool adapt_window(int T, std::string& err);
     bool load_mtp(std::string& err);
     void mtp_enqueue(int T);
     bool capture(int T, std::string& err);
@@ -137,6 +148,14 @@ private:
     size_t vram_free_after_init_ = 0;
     std::vector<std::vector<int>> resident_;   // [layer][expert] -> slot, -1 = not resident
     std::vector<float> profile_score_;         // [layer][expert] the profile's share of its layer's picks
+    std::vector<float> recent_;                // [layer][expert] decayed recent picks (in units of 1 / recent_scale_)
+    float recent_scale_ = 1.f;
+    std::vector<int> spares_;                  // slots holding no resident expert (copy targets)
+    struct Swap { int layer, expert, slot; cudaEvent_t done; };
+    std::vector<Swap> in_flight_;
+    cudaStream_t copy_stream_ = nullptr;
+    void* raw_copy_ = nullptr;                 // the copy stream's GGUF-layout buffer
+    int windows_since_adapt_ = 0;
     std::vector<unsigned long long> slot_addr_;
     // v1: the CPU's share
     std::unique_ptr<kernels::cpu::ExpertPool> pool_;
