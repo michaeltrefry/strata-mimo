@@ -425,11 +425,18 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
 
   # ---- MiMo-V2.6-Flash (docs/MIMO_PORT_PLAN.md) -------------------------------------------------------------
-  add_library(strata_mimo STATIC src/mimo/model.cpp)
+  add_library(strata_mimo STATIC src/mimo/model.cpp src/mimo/attn.cu)
   target_include_directories(strata_mimo PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   target_link_libraries(strata_mimo PUBLIC strata_artifact strata_warnings ${_strata_gpu_runtime_target})
   add_executable(strata-mimo-inspect src/program/mimo_inspect.cpp)
   target_link_libraries(strata-mimo-inspect PRIVATE strata_mimo)
+  if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
+    # decode attention against a CPU reference of llama.cpp's formula (synthetic, no model); --bench for timings
+    add_executable(mimo_attn_test tests/cuda/mimo_attn_test.cpp)
+    target_link_libraries(mimo_attn_test PRIVATE strata_mimo)
+    add_test(NAME mimo_attn_test COMMAND mimo_attn_test)
+    set_tests_properties(mimo_attn_test PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
 
   if(STRATA_ENABLE_HIP)
     enable_testing()
