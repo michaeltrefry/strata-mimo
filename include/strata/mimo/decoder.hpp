@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -67,6 +68,15 @@ public:
     /// greedy prediction for each position + 1 to draft[t]; it also fills the layer's own KV (sliding window).
     bool mtp_forward(const int32_t* tokens, int T, int pos0, int32_t* draft, std::string& err);
     bool has_mtp() const { return mtp_arena_ != nullptr; }
+
+    /// The prompt tokens[0..n) at positions pos0.. (the KV before pos0 must hold the same tokens), then, with MTP,
+    /// the MTP layer's KV over the same positions.  `choose(logits of the last position, its greedy id)` picks the
+    /// first generated token (sampling, or just the greedy id); it is returned in *first, and with MTP the draft for
+    /// the position after it in *draft.  `progress(done)` is called after each window of the prompt.
+    using ChooseFn = std::function<int32_t(const float* logits, int32_t greedy)>;
+    bool prompt(const int32_t* tokens, int n, int pos0, const ChooseFn& choose, int32_t* first, int32_t* draft,
+                const std::function<void(int)>& progress, std::string& err);
+    int vocab() const { return model_.geometry().n_vocab; }
     size_t vram_free_after_init() const { return vram_free_after_init_; }
 
     const DecoderStats& stats() const { return stats_; }

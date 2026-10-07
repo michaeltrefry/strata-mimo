@@ -353,6 +353,29 @@ bool MimoDecoder::mtp_forward(const int32_t* tokens, int T, int pos0, int32_t* d
     return cuda_ok(cudaStreamSynchronize(s), "MTP", err);   // `tokens`, `pos0` and `draft` are the caller's
 }
 
+bool MimoDecoder::prompt(const int32_t* tokens, int n, int pos0, const ChooseFn& choose, int32_t* first,
+                         int32_t* draft, const std::function<void(int)>& progress, std::string& err) {
+    constexpr int W = kMaxT;
+    const int V = model_.geometry().n_vocab;
+    int32_t next[kMaxT], dr[kMaxT];
+    std::vector<float> logits;
+    for (int done = 0; done < n;) {
+        const int T = std::min(W, n - done);
+        const bool last = done + T == n;
+        if (!forward(tokens + done, T, pos0 + done, next, last ? &logits : nullptr, err)) return false;
+        if (last) *first = choose(logits.data() + (size_t) (T - 1) * V, next[T - 1]);
+        if (has_mtp()) {   // MTP position p pairs token p with the main model's state at p - 1
+            int32_t mt[kMaxT];
+            for (int t = 0; t < T; ++t) mt[t] = done + t + 1 < n ? tokens[done + t + 1] : *first;
+            if (!mtp_forward(mt, T, pos0 + done + 1, dr, err)) return false;
+            if (last && draft) *draft = dr[T - 1];
+        }
+        done += T;
+        if (progress) progress(done);
+    }
+    return true;
+}
+
 void MimoDecoder::release_gpu_waits() {
     if (h_flag_) {
         *(volatile uint32_t*) h_flag_ = UINT32_MAX;   // past every ring: a waiting kernel returns
@@ -541,9 +564,15 @@ bool MimoDecoder::forward(const int32_t* tokens, int T, int pos0, int32_t* next,
     cudaStream_t s = stream_;
     cudaMemcpyAsync(tok_, tokens, sizeof(int32_t) * T, cudaMemcpyHostToDevice, s);
     cudaMemcpyAsync(pos0_, &pos0, sizeof(int32_t), cudaMemcpyHostToDevice, s);
-    if (cfg_.graph && cfg_.cpu_experts && cfg_.dump_dir.empty() && !logits) {
+    if (cfg_.graph && cfg_.cpu_experts && cfg_.dump_dir.empty()) {
         if (!cuda_ok(cudaStreamSynchronize(s), "inputs", err)) return false;   // `tokens` / `pos0` live on the stack
-        return forward_graph(T, pos0, next, err);
+        if (!forward_graph(T, pos0, next, err)) return false;
+        if (logits) {
+            logits->resize((size_t) T * g.n_vocab);
+            return cuda_ok(cudaMemcpy(logits->data(), logits_, sizeof(float) * logits->size(), cudaMemcpyDeviceToHost),
+                           "logits", err);
+        }
+        return true;
     }
     if (!cfg_.dump_dir.empty()) {
         cudaStreamSynchronize(s);
