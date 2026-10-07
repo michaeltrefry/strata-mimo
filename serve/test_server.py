@@ -2329,5 +2329,29 @@ class LostStep(unittest.TestCase):
         self.run_mode("stop", stream=False)
 
 
+class ThinkingNotOpenedByTheTemplate(unittest.TestCase):
+    """MiMo's chat template leaves `<think>` to the model: a reply is reasoning only when it starts with the tag,
+    and a model that answers at once writes no block - its answer must be content (it was filed as reasoning, and
+    a client saw an empty reply)."""
+
+    def events(self, chunks, opened):
+        from serve.frontend import OutputParser
+        p = OutputParser(thinking=True, opened=opened)
+        out = []
+        for c in chunks:
+            out += [(e.kind, e.text) for e in p.feed(c)]
+        return out
+
+    def test_a_direct_answer_is_content(self):
+        self.assertEqual(self.events(["Tok", "yo."], opened=False), [("content", "Tok"), ("content", "yo.")])
+
+    def test_a_block_the_model_opens_is_reasoning(self):
+        self.assertEqual(self.events(["<thi", "nk>hmm</think>", "Tokyo."], opened=False),
+                         [("reasoning", "hmm"), ("content", "Tokyo.")])
+
+    def test_a_template_that_opens_the_block_is_unchanged(self):
+        self.assertEqual(self.events(["hmm</think>Tokyo."], opened=True), [("reasoning", "hmm"), ("content", "Tokyo.")])
+
+
 if __name__ == "__main__":
     unittest.main()

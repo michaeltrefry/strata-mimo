@@ -1434,7 +1434,11 @@ class Service:
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
-        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
+        # does the prompt end inside an opened thinking block (Qwen3.8's template), or is `<think>` left to the
+        # model (MiMo's)?  Read from the prompt's own last tokens, so the template decides, not the model's name.
+        tail = self.tok.decode(list(ids[-16:])) if ids else ""   # 16: enough for a byte-level tokenizer too
+        opened = tail.rstrip().endswith("<think>")
+        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True, opened=opened)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)

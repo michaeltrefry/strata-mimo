@@ -369,13 +369,17 @@ class OutputParser:
     """Incremental parser of the model's text. Feed deltas; get events. A tag split across deltas is held back
     until it is complete, so clients never see `<tool_` or `</thi`."""
 
-    def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False):
+    def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
+                 opened: bool = True):
         self.state = "reasoning" if thinking else "content"
         self.buf = ""
         self.lead = False
-        # MiMo's chat template leaves `<think>` to the model (Qwen3.8's writes it into the prompt): an opening tag
-        # at the very start of the reasoning is the block's own, not text to show
+        # `opened`: the prompt itself ends inside a thinking block (Qwen3.8's template writes `<think>` into it).
+        # When it does not (MiMo's template leaves `<think>` to the model), the reply is reasoning only if it starts
+        # with `<think>` - a model that answers at once ("Tokyo.") writes no block at all, and its answer is content.
+        # Either way an opening tag at the very start is the block's own, not text to show.
         self.opening = thinking
+        self.opened = opened
         self.schemas = {t.get("name"): t for t in tools or []}
         # stream_tools: a tool call is also reported while it is being written - "tool_start" (its name and id) as
         # soon as the name is known, then "tool_args" pieces of its JSON arguments (string parameters character by
@@ -516,7 +520,10 @@ class OutputParser:
                     return out
                 if lead.startswith(THINK_START):
                     self.buf = lead[len(THINK_START):]
+                elif not self.opened:   # no block: this is the answer
+                    self.state, self.lead = "content", True
                 self.opening = False
+                continue
             if self.state == "reasoning":
                 i = self.buf.find(THINK_END)
                 if i < 0:
