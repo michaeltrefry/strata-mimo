@@ -29,6 +29,8 @@
 namespace strata::mimo {
 
 inline constexpr uint32_t kTypeF32 = 0, kTypeQ8_0 = 8, kTypeMXFP4 = 39;
+// attention / dense weights may also be re-quantized K-quants (served by native_mmvq and dequant_f16)
+inline constexpr uint32_t kTypeQ4_K = 12, kTypeQ5_K = 13, kTypeQ6_K = 14;
 
 struct MimoGeometry {
     int n_layer = 0, n_embd = 0, n_vocab = 0, n_head = 0;
@@ -168,8 +170,9 @@ inline std::string check_mimo_tensors(const GgufModel& model, const MimoGeometry
         const uint64_t qkv = (uint64_t) g.qkv_rows(l);
         if (!(e = want(b + "attn_norm.weight", {E}, {kTypeF32})).empty()) return e;
         if (!(e = want(b + "ffn_norm.weight", {E}, {kTypeF32})).empty()) return e;
-        if (!(e = want(b + "attn_qkv.weight", {E, qkv}, {kTypeQ8_0})).empty()) return e;
-        if (!(e = want(b + "attn_output.weight", {(uint64_t) g.attn_out_in(), E}, {kTypeQ8_0})).empty()) return e;
+        const std::vector<uint32_t> dense = {kTypeQ8_0, kTypeQ6_K, kTypeQ5_K, kTypeQ4_K};
+        if (!(e = want(b + "attn_qkv.weight", {E, qkv}, dense)).empty()) return e;
+        if (!(e = want(b + "attn_output.weight", {(uint64_t) g.attn_out_in(), E}, dense)).empty()) return e;
         const bool has_sinks = model.find(b + "attn_sinks.weight") != nullptr;
         if (has_sinks != g.is_swa(l))
             return b + "attn_sinks.weight " + (has_sinks ? "present on a global" : "missing on a sliding-window") + " layer";

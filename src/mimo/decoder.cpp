@@ -37,8 +37,14 @@ bool cuda_ok(cudaError_t st, const char* what, std::string& err) {
     return false;
 }
 
+// y = W x for T tokens, W in its GGUF blocks (Q8_0, or a K-quant the attention may be re-quantized to)
 void q8_0_gemv(const DevTensor& w, const float* x, void* q8, float* y, int T, cudaStream_t s) {
-    strata::kernels::native_q8_0_f32(w.data, x, q8, y, (int) w.ne0, (int) w.ne1, T, s);
+    if (w.type == kTypeQ8_0) {
+        strata::kernels::native_q8_0_f32(w.data, x, q8, y, (int) w.ne0, (int) w.ne1, T, s);
+        return;
+    }
+    strata::kernels::native_quantize_q8_1(x, q8, (int) w.ne0, T, s);
+    strata::kernels::native_mmvq((int) w.type, w.data, q8, y, (int) w.ne0, (int) w.ne1, T, s);
 }
 
 // MIMOPROF v1 (tools/mimo/make_profile.py): score[layer][expert]
