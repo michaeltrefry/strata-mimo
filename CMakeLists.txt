@@ -425,13 +425,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
 
   # ---- MiMo-V2.6-Flash (docs/MIMO_PORT_PLAN.md) -------------------------------------------------------------
-  add_library(strata_mimo STATIC src/mimo/model.cpp src/mimo/router.cu src/mimo/ops.cu src/mimo/attn.cu src/mimo/decoder.cpp)
+  add_library(strata_mimo STATIC src/mimo/model.cpp src/mimo/router.cu src/mimo/ops.cu src/mimo/attn.cu src/mimo/decoder.cpp
+                          src/mimo/cpu_experts.cpp)
   if(STRATA_ENABLE_CUDA)
     # step 3: the resident experts' MXFP4 kernels (CUDA only for now: inline PTX loads)
     target_sources(strata_mimo PRIVATE src/mimo/kernels/expert_mxfp4.cu)
   endif()
   target_include_directories(strata_mimo PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
-  target_link_libraries(strata_mimo PUBLIC strata_artifact strata_warnings ${_strata_gpu_runtime_target})
+  target_link_libraries(strata_mimo PUBLIC strata_artifact strata_warnings strata_kernels_cpu ${_strata_gpu_runtime_target})
   add_executable(strata-mimo-inspect src/program/mimo_inspect.cpp)
   target_link_libraries(strata_mimo PUBLIC strata_kernels)
   add_executable(strata-mimo-run src/program/mimo_run.cpp)
@@ -451,6 +452,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(mimo_dense_q8_0_bench tests/mimo/dense_q8_0_bench.cu)
     target_include_directories(mimo_dense_q8_0_bench PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(mimo_dense_q8_0_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  endif()
+  if(STRATA_BUILD_TESTS AND STRATA_NATIVE_EXPERTS)
+    # step 2: the CPU experts against a float reference on the real model's experts, and their speed
+    # (both need the GGUF: mimo_cpu_experts_parity <shard>, mimo_cpu_experts_bench <shard>)
+    add_executable(mimo_cpu_experts_parity tests/mimo/cpu_experts_parity.cpp)
+    target_link_libraries(mimo_cpu_experts_parity PRIVATE strata_mimo ggml-base ggml-cpu)
+    add_executable(mimo_cpu_experts_bench tools/mimo/cpu_experts_bench.cpp)
+    target_link_libraries(mimo_cpu_experts_bench PRIVATE strata_mimo)
   endif()
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
     # decode attention against a CPU reference of llama.cpp's formula (synthetic, no model); --bench for timings
@@ -850,16 +859,17 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
 endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
-            src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp)
+            src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/mxfp4_avx512.cpp)
 target_include_directories(strata_kernels_cpu PUBLIC include)
 # Plan v0.3 P6: only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
 # and the engine picks the kernels at run time (cpu_avx512_ok).
 if(MSVC)
   set_source_files_properties(src/kernels/cpu/expert.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+  set_source_files_properties(src/kernels/cpu/mxfp4_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
   set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
 else()
   # GCC/Clang spell it differently, and `-mavx512vnni` alone is not enough: VBMI is a separate feature bit.
-  set_source_files_properties(src/kernels/cpu/expert.cpp
+  set_source_files_properties(src/kernels/cpu/expert.cpp src/kernels/cpu/mxfp4_avx512.cpp
                               PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
   set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
 endif()

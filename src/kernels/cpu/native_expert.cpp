@@ -7,6 +7,7 @@
 #include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/cpu/kq_avx2.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/mxfp4_avx512.hpp"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -61,7 +62,8 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
     f.bytes = f.down_off + f.d_row * (size_t) n_embd;
     f.act_bytes = ggml_row_size(tg->vec_dot_type, n_embd);
     f.h_bytes = ggml_row_size(td->vec_dot_type, n_ff);
-    if (f.act_bytes > kNativeActBytes || f.h_bytes > kNativeHBytes) {
+    f.h_block = (int) ggml_blck_size(td->vec_dot_type);
+    if (f.act_bytes > kNativeActBytes || f.h_bytes > kNativeHBytes || n_ff > kNativeMaxFF || n_embd > kNativeMaxEmbd) {
         err = "native experts: activation larger than the pool's buffers";
         return false;
     }
@@ -76,8 +78,49 @@ void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
     traits(f.d_act)->from_float(h, dst, f.n_ff);
 }
 
+void native_quant_h_part(const NativeFmt& f, const float* h, int r0, int r1, void* dst) {
+    traits(f.d_act)->from_float(h + r0, (uint8_t*) dst + ggml_row_size((ggml_type) f.d_act, r0), r1 - r0);
+}
+
+namespace {
+// MiMo's MXFP4 experts on the AVX-512 kernel (bitwise ggml's dot); STRATA_NO_MXFP4_512=1 keeps ggml's
+bool g_mxfp4_512 = mxfp4_512_ok() && std::getenv("STRATA_NO_MXFP4_512") == nullptr;
+bool mxfp4_fast(int type) { return g_mxfp4_512 && type == 39; }
+}  // namespace
+
+void native_set_mxfp4_512(int mode) {
+    g_mxfp4_512 = mxfp4_512_ok() && (mode < 0 ? std::getenv("STRATA_NO_MXFP4_512") == nullptr : mode != 0);
+}
+bool native_mxfp4_512() { return g_mxfp4_512; }
+
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1) {
+    native_gu_rows_at(f, blob, blob + f.up_off, act, nt, ff, r0, r1);
+}
+
+void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
+                      int r0, int r1) {
+    native_down_rows_at(f, blob + f.down_off, hq, nt, out, r0, r1);
+}
+
+void native_gu_rows_at(const NativeFmt& f, const uint8_t* gate, const uint8_t* up, const void* const* act, int nt,
+                       float* const* ff, int r0, int r1) {
+    if (mxfp4_fast(f.gu_type)) {
+        thread_local float gbuf[MAXT][kNativeMaxFF], ubuf[MAXT][kNativeMaxFF];
+        float* gp[MAXT];
+        float* upp[MAXT];
+        for (int t = 0; t < nt; ++t) { gp[t] = gbuf[t]; upp[t] = ubuf[t]; }
+        mxfp4_rows2(gate, up, f.gu_row, (int) f.n_embd, act, nt, gp, upp, r0, r1);
+        for (int r = r0; r < r1; ++r)
+            for (int t = 0; t < nt; ++t) {
+                const float g = gbuf[t][r], u = ubuf[t][r];
+                ff[t][r] = (g / (1.f + std::exp(-g))) * u;
+            }
+        return;
+    }
+    // the IQ / K-quant kernels take one blob and the up matrix's offset in it (a pack's blob: up follows gate)
+    const uint8_t* blob = gate;
+    const size_t up_off = (size_t) (up - gate);
     // the multi-token kernels decode the weights once for all tokens: 2.0-2.4x ggml-cpu at three tokens, no faster
     // at one (all are bound by the codebook lookups, ~5 GB/s per core), measured by native_expert_parity.  AVX-512
     // first, then the AVX-2 one (Zen 2/3, Intel 12th-14th gen).  STRATA_NO_IQ512 drops an AVX-512 CPU to the
@@ -95,7 +138,7 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // ~1.4 tokens and the weights stay in L1 across ggml's per-token calls; 1.01-1.13x in native_expert_parity).
     static const bool kq = [] { const char* v = std::getenv("STRATA_KQ256"); return v != nullptr && std::atoi(v) != 0; }();
     if (kq && f.gu_type == 12 && nt >= 2) {   // one token: ggml's own dot below (the same bits, less overhead)
-        kq256_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
+        kq256_gu_rows(f.gu_type, blob, f.gu_row, up_off, (int) f.n_embd, act, nt, ff, r0, r1);
         return;
     }
     // A format with only an AVX-2 kernel (IQ4_XS, #415) takes it on AVX-2 CPUs only: an AVX-512 CPU keeps ggml-cpu for
@@ -104,19 +147,19 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     static const bool cpu512 = cpu_avx512_ok();
     if (nt >= mt_min && (iq512_supported(f.gu_type) || (!cpu512 && iq256_supported(f.gu_type)))) {
         if (avx512 && iq512_supported(f.gu_type)) {
-            iq512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
+            iq512_gu_rows(f.gu_type, blob, f.gu_row, up_off, (int) f.n_embd, act, nt, ff, r0, r1);
             return;
         }
         if (avx2 && iq256_supported(f.gu_type)) {
-            iq256_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
+            iq256_gu_rows(f.gu_type, blob, f.gu_row, up_off, (int) f.n_embd, act, nt, ff, r0, r1);
             return;
         }
     }
     const ggml_vec_dot_t dot = traits(f.gu_type)->vec_dot;
     const int n = (int) f.n_embd;
     for (int r = r0; r < r1; ++r) {
-        const uint8_t* gr = blob + (size_t) r * f.gu_row;
-        const uint8_t* ur = blob + f.up_off + (size_t) r * f.gu_row;
+        const uint8_t* gr = gate + (size_t) r * f.gu_row;
+        const uint8_t* ur = up + (size_t) r * f.gu_row;
         for (int t = 0; t < nt; ++t) {
             float g = 0.f, u = 0.f;
             dot(n, &g, 0, gr, 0, act[t], 0, 1);
@@ -126,25 +169,29 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     }
 }
 
-void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
-                      int r0, int r1) {
+void native_down_rows_at(const NativeFmt& f, const uint8_t* down, const void* const* hq, int nt, float* const* out,
+                         int r0, int r1) {
+    if (mxfp4_fast(f.d_type)) {
+        mxfp4_rows(down, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        return;
+    }
     // IQ4_NL down rows: the AVX-2 multi-token kernel decodes the nibbles and absolutises the weights once per
     // block instead of once per token; ggml-cpu's dot is single-token.  STRATA_NO_IQ4NL falls back to it.
     static const bool iq4nl_mt = std::getenv("STRATA_NO_IQ4NL") == nullptr;
     static const int mt_min = [] { const char* e = std::getenv("STRATA_IQ_MT_MIN"); return e ? std::atoi(e) : 2; }();
     static const bool kq = [] { const char* v = std::getenv("STRATA_KQ256"); return v != nullptr && std::atoi(v) != 0; }();
     if (kq && nt >= 2 && (f.d_type == 7 || f.d_type == 8)) {   // Q5_1 / Q8_0 down: bit-exact, any group size
-        kq256_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        kq256_rows(f.d_type, down, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
     }
     if (nt >= mt_min && f.d_type == 20 && iq4nl_mt) {   // #152: the same rule as the gate/up rows
-        iq4nl256_down_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        iq4nl256_down_rows(down, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
     }
     const ggml_vec_dot_t dot = traits(f.d_type)->vec_dot;
     const int n = (int) f.n_ff;
     for (int r = r0; r < r1; ++r) {
-        const uint8_t* dr = blob + f.down_off + (size_t) r * f.d_row;
+        const uint8_t* dr = down + (size_t) r * f.d_row;
         for (int t = 0; t < nt; ++t) {
             float s = 0.f;
             dot(n, &s, 0, dr, 0, hq[t], 0, 1);

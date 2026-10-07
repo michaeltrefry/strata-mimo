@@ -532,9 +532,43 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
             const int e = (int) i / parts_b_, part = (int) i % parts_b_;
             const int r0 = H * part / parts_b_, r1 = H * (part + 1) / parts_b_;
             s2_expert_down_rows(jobs_[e].blob, split_[(size_t) e].a2, jobs_[e].out, r0, r1);
+        } else if (mode_ == 7) {
+            // MiMo: gate/up rows of every expert in whole blocks of the down activation, quantized right here
+            const int hb = nfmt_->h_block, nff = (int) nfmt_->n_ff;
+            const int64_t u0 = mrows_ * (int64_t) i / mtasks_, u1 = mrows_ * (int64_t) (i + 1) / mtasks_;
+            for (int64_t r = u0 * hb; r < u1 * hb;) {
+                const int e = (int) (r / nff), r0 = (int) (r % nff);
+                const int r1 = (int) std::min<int64_t>(nff, r0 + (u1 * hb - r));
+                const MoeExpert& x = mex_[e];
+                SplitBufMulti& sb = split_multi_[(size_t) e];
+                const void* act[MAXT];
+                float* ff[MAXT];
+                for (int k = 0; k < x.nt; ++k) { act[k] = mact_[x.tok[k]]; ff[k] = sb.ff[k]; }
+                native_gu_rows_at(*nfmt_, x.gate, x.up, act, x.nt, ff, r0, r1);
+                for (int k = 0; k < x.nt; ++k) native_quant_h_part(*nfmt_, sb.ff[k], r0, r1, sb.hq[k]);
+                r += r1 - r0;
+            }
+        } else if (mode_ == 8) {
+            // MiMo: output rows [r0, r1) of every token, every expert summed into them with its router weight
+            const int ne = (int) nfmt_->n_embd;
+            const int r0 = (int) ((int64_t) ne * i / mtasks_), r1 = (int) ((int64_t) ne * (i + 1) / mtasks_);
+            thread_local float tmp[MAXT][kNativeMaxEmbd];
+            for (int t = 0; t < mntok_; ++t) std::fill(mout_[t] + r0, mout_[t] + r1, 0.f);
+            for (int e = 0; e < njobs_; ++e) {
+                const MoeExpert& x = mex_[e];
+                const void* hq[MAXT];
+                float* tp[MAXT];
+                for (int k = 0; k < x.nt; ++k) { hq[k] = split_multi_[(size_t) e].hq[k]; tp[k] = tmp[k]; }
+                native_down_rows_at(*nfmt_, x.down, hq, x.nt, tp, r0, r1);
+                for (int k = 0; k < x.nt; ++k) {
+                    float* o = mout_[x.tok[k]];
+                    const float w = x.w[k];
+                    for (int r = r0; r < r1; ++r) o[r] += w * tmp[k][r];
+                }
+            }
         } else if (mode_ >= 5) {
             // plan v0.3 P6: native layers, 5 = gate/up rows, 6 = down rows
-            const int per = mode_ == 5 ? FF : H;
+            const int per = mode_ == 5 ? (int) nfmt_->n_ff : (int) nfmt_->n_embd;
             const int64_t g0 = mrows_ * (int64_t) i / mtasks_, g1 = mrows_ * (int64_t) (i + 1) / mtasks_;
             for (int64_t r = g0; r < g1;) {
                 const int e = (int) (r / per), r0 = (int) (r % per);
@@ -593,14 +627,17 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
     }
 }
 
-void ExpertPool::run_phase(int mode, int n_tasks) {
-    wait_parked("before a phase");
+void ExpertPool::run_phase(int mode, int n_tasks, bool park_waits) {
+    // `park_waits = false` (run_moe's opt-in; measured no faster, docs/MIMO_CPU_EXPERTS.md): no wait for the workers
+    // to park, before or after.  Safe because every claim carries its batch's epoch (issue #29): once `wait_done` has seen all of a batch's jobs, a worker still in
+    // that batch's drain loop can only fail its next claim and park, and nothing it reads after a FAILED claim is
+    // what the host rewrites for the next batch.  It saves two rounds of 23 workers' cache-line traffic per phase.
+    if (park_waits) wait_parked("before a phase");
     mode_ = mode;
-    njobs_ = n_tasks;
     const uint32_t e = begin_batch(n_tasks);
     if (host_works_) drain(-1, host_scratch_, e);
     wait_done(n_tasks);
-    wait_parked("after a phase");
+    if (park_waits) wait_parked("after a phase");
     hstate_.store(kIdle, std::memory_order_relaxed);
     hstate_ms_.store(now_ms(), std::memory_order_relaxed);
 }
@@ -670,16 +707,16 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         nfmt_ = &f;
         const int threads = n_ + (host_works_ ? 1 : 0);
         mtasks_ = 3 * threads;
-        mrows_ = (int64_t) nb * FF;
+        mrows_ = (int64_t) nb * f.n_ff;
         const auto a = std::chrono::steady_clock::now();
         run_phase(5, mtasks_);
         const auto b = std::chrono::steady_clock::now();
         for (int e = 0; e < nb; ++e)
             for (int t = 0; t < mjobs_[e].nt; ++t)
-                if (f.d_type == 42) act_quant_any(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
+                if (f.d_type == 42) act_quant_any(split_multi_[(size_t) e].ff[t], (int) f.n_ff, split_multi_[(size_t) e].a2[t]);
                 else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
         const auto c = std::chrono::steady_clock::now();
-        mrows_ = (int64_t) nb * H;
+        mrows_ = (int64_t) nb * f.n_embd;
         run_phase(6, mtasks_);
         const auto d = std::chrono::steady_clock::now();
         ms_multi_gu += std::chrono::duration<double, std::milli>(b - a).count();
@@ -689,6 +726,40 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
     multi_bytes += (int64_t) n * (int64_t) f.bytes;
     mode_ = 0;
     ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
+void ExpertPool::run_moe(const NativeFmt& f, const MoeExpert* ex, int n, const void* const* act, int n_tok,
+                         float* const* out) {
+    if (n_tok <= 0) return;
+    if (n <= 0) {
+        for (int t = 0; t < n_tok; ++t) std::fill(out[t], out[t] + f.n_embd, 0.f);
+        return;
+    }
+    if (n > kMaxSplitMulti || n_tok > MAXT || f.n_ff % f.h_block) {
+        std::fprintf(stderr, "strata: run_moe: %d experts / %d tokens out of range\n", n, n_tok);
+        std::abort();
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    mex_ = ex;
+    mact_ = act;
+    mout_ = out;
+    mntok_ = n_tok;
+    nfmt_ = &f;
+    njobs_ = n;   // the expert count, for mode 8 (the phases' task counts are mtasks_)
+    const int threads = n_ + (host_works_ ? 1 : 0);
+    const int per = (std::max)(1, moe_tasks_per_thread);
+    mrows_ = (int64_t) n * (f.n_ff / f.h_block);   // phase 1 in units of whole quantization blocks
+    mtasks_ = (int) (std::min)((int64_t) threads * per, mrows_);
+    run_phase(7, mtasks_, moe_park_waits);
+    const auto t1 = std::chrono::steady_clock::now();
+    mtasks_ = (int) (std::min)((int64_t) threads * per, f.n_embd);
+    run_phase(8, mtasks_, moe_park_waits);
+    const auto t2 = std::chrono::steady_clock::now();
+    ms_moe_gu += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    ms_moe_down += std::chrono::duration<double, std::milli>(t2 - t1).count();
+    moe_bytes += (int64_t) n * (int64_t) f.bytes;
+    mode_ = 0;
+    ms_drain_ += std::chrono::duration<double, std::milli>(t2 - t0).count();
 }
 
 void ExpertPool::run(ExpertJob* jobs, int n) {
