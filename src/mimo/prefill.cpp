@@ -194,34 +194,40 @@ bool MimoDecoder::prompt_batched(const int32_t* tokens, int n, int pos0, const C
         }
         // decode reads the window's final hidden state from x_: leave the slice's last position there
         cudaMemcpyAsync(x_, xl, sizeof(float) * E, cudaMemcpyDeviceToDevice, s);
-        if (has_mtp()) {   // the MTP layer over positions base + 1 .. base + S: token p with the state at p - 1
+        if (has_mtp()) {   // the MTP layers over positions base + 1 .. base + S: token p with the state at p - 1
             std::vector<int32_t> mt((size_t) S);
             for (int j = 0; j < S; ++j) mt[(size_t) j] = done + j + 1 < n ? tokens[done + j + 1] : *first;
             cudaMemcpyAsync(pTok_, mt.data(), sizeof(int32_t) * S, cudaMemcpyHostToDevice, s);
-            embed_q8_0(model_.token_embd().data, pTok_, pY_, S, E, s);   // pY_: the MTP layer's token rows
-            bool first_tile = true;
-            for (int r = 0; r < S; r += cfg_.prefill_tile) {
-                const int T = std::min(cfg_.prefill_tile, S - r);
-                float* er = pY_ + (size_t) r * E;
-                mimo_rmsnorm(er, (const float*) mtp_.enorm.data, er, E, T, g.rms_eps, s);
-                mimo_rmsnorm(pX_ + (size_t) r * E, (const float*) mtp_.hnorm.data, pHn_ + (size_t) r * E, E, T, g.rms_eps, s);
-                concat_rows(er, pHn_ + (size_t) r * E, pG_, T, E, s);   // [T][8192] in pG_ (n_ff >= 2 n_embd)
-                prefill::to_f16(pG_, p16_, (int64_t) T * 2 * E, s);
-                float* mr = pHn_ + (size_t) r * E;                        // the MTP residual stream, in place
-                gemm_q8(mtp_.eh_proj, pW1_, true, p16_, mr, T);
-                prefill_attention(mtp_.attn_norm, mtp_.attn_qkv, mtp_.attn_output, mtp_attn_, mtp_kv_, mr, T,
-                                  base + 1 + r, true, first_tile);
-                mimo_rmsnorm(mr, (const float*) mtp_.ffn_norm.data, pE_, E, T, g.rms_eps, s);
-                cudaMemcpyAsync(pA_, pE_, sizeof(float) * T * E, cudaMemcpyDeviceToDevice, s);
-                prefill_dense_ffn(mtp_.ffn_gate, mtp_.ffn_up, mtp_.ffn_down, pA_, mr, T);
-                first_tile = false;
-            }
+            auto run_layer = [&](const MtpLayer& m, const AttnKv& kv, const AttnLayer& al) {
+                embed_q8_0(model_.token_embd().data, pTok_, pY_, S, E, s);   // pY_: the MTP layer's token rows
+                bool first_tile = true;
+                for (int r = 0; r < S; r += cfg_.prefill_tile) {
+                    const int T = std::min(cfg_.prefill_tile, S - r);
+                    float* er = pY_ + (size_t) r * E;
+                    mimo_rmsnorm(er, (const float*) m.enorm.data, er, E, T, g.rms_eps, s);
+                    mimo_rmsnorm(pX_ + (size_t) r * E, (const float*) m.hnorm.data, pHn_ + (size_t) r * E, E, T, g.rms_eps, s);
+                    concat_rows(er, pHn_ + (size_t) r * E, pG_, T, E, s);   // [T][8192] in pG_ (n_ff >= 2 n_embd)
+                    prefill::to_f16(pG_, p16_, (int64_t) T * 2 * E, s);
+                    float* mr = pHn_ + (size_t) r * E;                        // the layer's residual stream, in place
+                    gemm_q8(m.eh_proj, pW1_, true, p16_, mr, T);
+                    prefill_attention(m.attn_norm, m.attn_qkv, m.attn_output, al, kv, mr, T, base + 1 + r, true, first_tile);
+                    mimo_rmsnorm(mr, (const float*) m.ffn_norm.data, pE_, E, T, g.rms_eps, s);
+                    cudaMemcpyAsync(pA_, pE_, sizeof(float) * T * E, cudaMemcpyDeviceToDevice, s);
+                    prefill_dense_ffn(m.ffn_gate, m.ffn_up, m.ffn_down, pA_, mr, T);
+                    first_tile = false;
+                }
+            };
+            run_layer(mtp_, mtp_kv_, mtp_attn_);
+            const float* ml = pHn_ + (size_t) (S - 1) * E;
             if (last_slice && draft) {
-                const float* ml = pHn_ + (size_t) (S - 1) * E;
                 mimo_rmsnorm(ml, (const float*) mtp_.out_norm.data, h_, E, 1, g.rms_eps, s);
                 strata::kernels::native_q8_0_f32(model_.output().data, h_, q8_, logits_, E, V, 1, s);
                 argmax_rows(logits_, next_, 1, V, s);
                 cudaMemcpyAsync(draft, next_, 4, cudaMemcpyDeviceToHost, s);
+            }
+            if (has_mtp2()) {   // the second layer: its KV over the same positions; the first one's last row for draft 2
+                cudaMemcpyAsync(hd_, ml, sizeof(float) * E, cudaMemcpyDeviceToDevice, s);
+                run_layer(mtp2_, mtp2_kv_, mtp2_attn_);
             }
         }
         if (!ok(cudaStreamSynchronize(s), "prompt slice", err)) return false;

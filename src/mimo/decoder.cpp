@@ -77,6 +77,9 @@ MimoDecoder::~MimoDecoder() {
     for (auto& sw : in_flight_) cudaEventDestroy(sw.done);
     if (copy_stream_) cudaStreamDestroy(copy_stream_);
     attn_kv_free(mtp_kv_);
+    attn_kv_free(mtp2_kv_);
+    if (mtp2_arena_) cudaFree(mtp2_arena_);
+    if (draft2_graph_) cudaGraphExecDestroy(draft2_graph_);
     attn_prompt_scratch_free(aps_);
     pmoe_.reset();
     gemm_.reset();
@@ -138,7 +141,8 @@ bool MimoDecoder::init(std::string& err) {
     // (on Windows an allocation past the VRAM does not fail, it lands in system memory and runs at PCIe speed)
     if (!cfg_.mtp_path.empty()) {
         if (!dev(kMaxT * E * 4, &e_) || !dev(kMaxT * E * 8, &cat_) || !dev(kMaxT * E * 4, &mres_) ||
-            !dev(kMaxT * 4, &mtp_tok_) || !dev(4, &mtp_pos0_) || !load_mtp(err))
+            !dev(kMaxT * 4, &mtp_tok_) || !dev(4, &mtp_pos0_) || !dev(kMaxT * E * 4, &mres2_) ||
+            !dev(E * 4, &hd_) || !dev(4, &d2_tok_) || !dev(4, &d2_pos_) || !load_mtp(err))
             return false;
     }
     if (cfg_.batched_prefill && cfg_.cpu_experts && cfg_.graph && !prefill_alloc(err)) return false;
@@ -279,33 +283,33 @@ bool MimoDecoder::init(std::string& err) {
 
 // The first nextn layer of the MTP GGUF into VRAM (its own copies of the embedding and head are not needed: llama.cpp
 // also uses the main model's when nextn.embed_tokens / shared_head_head are absent, as they are here).
-bool MimoDecoder::load_mtp(std::string& err) {
+bool MimoDecoder::load_mtp_layer(int k, MtpLayer& m, void*& arena, AttnKv& kv, AttnLayer& al, std::string& err) {
     const MimoGeometry& g = model_.geometry();
     try {
         GgufModel mtp = GgufModel::open(cfg_.mtp_path);
         const MetaValue* arch = mtp.meta().get("general.architecture");
         const MetaValue* nn = mtp.meta().get("mimo2.nextn_predict_layers");
-        if (!arch || arch->s != "mimo2" || !nn || nn->u < 1) {
+        if (!arch || arch->s != "mimo2" || !nn || nn->u < (uint64_t) k + 1) {
             err = cfg_.mtp_path + " is not a MiMo MTP file (mimo2 with nextn_predict_layers)";
             return false;
         }
-        const int L = g.n_layer;   // the first nextn layer: blk.48
+        const int L = g.n_layer + k;   // nextn layer k: blk.48 + k
         const std::string b = "blk." + std::to_string(L) + ".";
         const uint64_t E = (uint64_t) g.n_embd, F = (uint64_t) g.n_ff_dense, Q = (uint64_t) g.qkv_rows(1);
         struct Want { const char* name; DevTensor* dst; std::vector<uint64_t> shape; uint32_t type; };
         const Want want[] = {
-            {"nextn.eh_proj.weight", &mtp_.eh_proj, {2 * E, E}, kTypeQ8_0},
-            {"nextn.enorm.weight", &mtp_.enorm, {E}, kTypeF32},
-            {"nextn.hnorm.weight", &mtp_.hnorm, {E}, kTypeF32},
-            {"attn_norm.weight", &mtp_.attn_norm, {E}, kTypeF32},
-            {"attn_qkv.weight", &mtp_.attn_qkv, {E, Q}, kTypeQ8_0},
-            {"attn_output.weight", &mtp_.attn_output, {(uint64_t) g.attn_out_in(), E}, kTypeQ8_0},
-            {"attn_sinks.weight", &mtp_.attn_sinks, {(uint64_t) g.n_head}, kTypeF32},
-            {"ffn_norm.weight", &mtp_.ffn_norm, {E}, kTypeF32},
-            {"ffn_gate.weight", &mtp_.ffn_gate, {E, F}, kTypeQ8_0},
-            {"ffn_up.weight", &mtp_.ffn_up, {E, F}, kTypeQ8_0},
-            {"ffn_down.weight", &mtp_.ffn_down, {F, E}, kTypeQ8_0},
-            {"layer_output_norm.weight", &mtp_.out_norm, {E}, kTypeF32},
+            {"nextn.eh_proj.weight", &m.eh_proj, {2 * E, E}, kTypeQ8_0},
+            {"nextn.enorm.weight", &m.enorm, {E}, kTypeF32},
+            {"nextn.hnorm.weight", &m.hnorm, {E}, kTypeF32},
+            {"attn_norm.weight", &m.attn_norm, {E}, kTypeF32},
+            {"attn_qkv.weight", &m.attn_qkv, {E, Q}, kTypeQ8_0},
+            {"attn_output.weight", &m.attn_output, {(uint64_t) g.attn_out_in(), E}, kTypeQ8_0},
+            {"attn_sinks.weight", &m.attn_sinks, {(uint64_t) g.n_head}, kTypeF32},
+            {"ffn_norm.weight", &m.ffn_norm, {E}, kTypeF32},
+            {"ffn_gate.weight", &m.ffn_gate, {E, F}, kTypeQ8_0},
+            {"ffn_up.weight", &m.ffn_up, {E, F}, kTypeQ8_0},
+            {"ffn_down.weight", &m.ffn_down, {F, E}, kTypeQ8_0},
+            {"layer_output_norm.weight", &m.out_norm, {E}, kTypeF32},
         };
         size_t total = 0;
         for (const Want& w : want) {
@@ -316,13 +320,13 @@ bool MimoDecoder::load_mtp(std::string& err) {
             }
             total += (tensor_payload_bytes(*t) + 255) / 256 * 256;
         }
-        if (!cuda_ok(cudaMalloc(&mtp_arena_, total), "MTP weights", err)) return false;
+        if (!cuda_ok(cudaMalloc(&arena, total), "MTP weights", err)) return false;
         size_t off = 0;
         for (const Want& w : want) {
             size_t shard = 0;
             const TensorInfo* t = mtp.find(b + w.name, &shard);
             const size_t bytes = (size_t) tensor_payload_bytes(*t);
-            uint8_t* dst = (uint8_t*) mtp_arena_ + off;
+            uint8_t* dst = (uint8_t*) arena + off;
             if (!cuda_ok(cudaMemcpy(dst, mtp.shard(shard).tensor_data(*t), bytes, cudaMemcpyHostToDevice), "MTP upload", err))
                 return false;
             *w.dst = DevTensor{dst, t->type, (int64_t) t->shape[0], t->shape.size() > 1 ? (int64_t) t->shape[1] : 1, bytes};
@@ -332,38 +336,76 @@ bool MimoDecoder::load_mtp(std::string& err) {
         err = std::string("MTP: ") + e.what();
         return false;
     }
-    if (!attn_kv_alloc(mtp_kv_, g.n_head_kv[1], kSwaRing, true, err)) return false;
-    mtp_attn_ = attn_layer(g.n_head, g.n_head_kv[1], true, g.n_swa, g.rope_base_swa, g.head_k,
-                           (const float*) mtp_.attn_sinks.data);
+    if (!attn_kv_alloc(kv, g.n_head_kv[1], kSwaRing, true, err)) return false;
+    al = attn_layer(g.n_head, g.n_head_kv[1], true, g.n_swa, g.rope_base_swa, g.head_k,
+                           (const float*) m.attn_sinks.data);
     return true;
+}
+
+bool MimoDecoder::load_mtp(std::string& err) {
+    if (!load_mtp_layer(0, mtp_, mtp_arena_, mtp_kv_, mtp_attn_, err)) return false;
+    return cfg_.mtp_heads < 2 || load_mtp_layer(1, mtp2_, mtp2_arena_, mtp2_kv_, mtp2_attn_, err);
 }
 
 // llama.cpp graph_mtp: cur = eh_proj([enorm(embed(tok)) | hnorm(h_prev)]); an SWA attention block with sinks and
 // value_scale; a dense SiLU FFN; then the head on layer_output_norm(cur).  h_prev = x_, the main window's final rows.
-void MimoDecoder::mtp_enqueue(int T) {
+void MimoDecoder::mtp_layer_enqueue(const MtpLayer& m, const AttnKv& kv, const AttnLayer& al, const int32_t* tok,
+                                    const int32_t* pos, const float* hsrc, float* mres, int T, bool head) {
     const MimoGeometry& g = model_.geometry();
     const int E = g.n_embd;
     cudaStream_t s = stream_;
-    embed_q8_0(model_.token_embd().data, mtp_tok_, e_, T, E, s);
-    mimo_rmsnorm(e_, (const float*) mtp_.enorm.data, e_, E, T, g.rms_eps, s);
-    mimo_rmsnorm(x_, (const float*) mtp_.hnorm.data, h_, E, T, g.rms_eps, s);
+    embed_q8_0(model_.token_embd().data, tok, e_, T, E, s);
+    mimo_rmsnorm(e_, (const float*) m.enorm.data, e_, E, T, g.rms_eps, s);
+    mimo_rmsnorm(hsrc, (const float*) m.hnorm.data, h_, E, T, g.rms_eps, s);
     concat_rows(e_, h_, cat_, T, E, s);
-    q8_0_gemv(mtp_.eh_proj, cat_, q8_, mres_, T, s);
-    mimo_rmsnorm(mres_, (const float*) mtp_.attn_norm.data, h_, E, T, g.rms_eps, s);
-    q8_0_gemv(mtp_.attn_qkv, h_, q8_, qkv_, T, s);
-    mimo_qkv_rope_append(qkv_, mtp_pos0_, T, mtp_attn_, mtp_kv_, q_, s);
-    mimo_attn_decode(q_, mtp_pos0_, T, mtp_attn_, mtp_kv_, attn_scratch_, a_, s);
-    q8_0_gemv(mtp_.attn_output, a_, q8_, y_, T, s);
-    mimo_residual_add(mres_, y_, g.value_scale, E * T, s);
-    mimo_rmsnorm(mres_, (const float*) mtp_.ffn_norm.data, h_, E, T, g.rms_eps, s);
-    q8_0_gemv(mtp_.ffn_gate, h_, q8_, g_, T, s);
-    q8_0_gemv(mtp_.ffn_up, h_, q8_, u_, T, s);
+    q8_0_gemv(m.eh_proj, cat_, q8_, mres, T, s);
+    mimo_rmsnorm(mres, (const float*) m.attn_norm.data, h_, E, T, g.rms_eps, s);
+    q8_0_gemv(m.attn_qkv, h_, q8_, qkv_, T, s);
+    mimo_qkv_rope_append(qkv_, pos, T, al, kv, q_, s);
+    mimo_attn_decode(q_, pos, T, al, kv, attn_scratch_, a_, s);
+    q8_0_gemv(m.attn_output, a_, q8_, y_, T, s);
+    mimo_residual_add(mres, y_, g.value_scale, E * T, s);
+    mimo_rmsnorm(mres, (const float*) m.ffn_norm.data, h_, E, T, g.rms_eps, s);
+    q8_0_gemv(m.ffn_gate, h_, q8_, g_, T, s);
+    q8_0_gemv(m.ffn_up, h_, q8_, u_, T, s);
     silu_mul(g_, u_, m_, T * g.n_ff_dense, s);
-    q8_0_gemv(mtp_.ffn_down, m_, q8_, y_, T, s);
-    add_scaled(mres_, y_, 1.f, E * T, s);
-    mimo_rmsnorm(mres_, (const float*) mtp_.out_norm.data, h_, E, T, g.rms_eps, s);
+    q8_0_gemv(m.ffn_down, m_, q8_, y_, T, s);
+    add_scaled(mres, y_, 1.f, E * T, s);
+    if (!head) return;
+    mimo_rmsnorm(mres, (const float*) m.out_norm.data, h_, E, T, g.rms_eps, s);
     q8_0_gemv(model_.output(), h_, q8_, logits_, T, s);
     argmax_rows(logits_, next_, T, g.n_vocab, s);
+}
+
+// The first nextn layer over the window (its draft per row in next_); its last row kept for mtp_draft2; then the
+// second layer over the same inputs, for its KV only (llama.cpp fills every head's KV from the main model's states).
+void MimoDecoder::mtp_enqueue(int T) {
+    const int E = model_.geometry().n_embd;
+    mtp_layer_enqueue(mtp_, mtp_kv_, mtp_attn_, mtp_tok_, mtp_pos0_, x_, mres_, T, true);
+    if (!mtp2_arena_) return;
+    cudaMemcpyAsync(hd_, mres_ + (size_t) (T - 1) * E, sizeof(float) * E, cudaMemcpyDeviceToDevice, stream_);
+    mtp_layer_enqueue(mtp2_, mtp2_kv_, mtp2_attn_, mtp_tok_, mtp_pos0_, x_, mres2_, T, false);
+}
+
+bool MimoDecoder::mtp_draft2(int32_t d1, int pos, int32_t* d2, std::string& err) {
+    if (!mtp2_arena_) { err = "no second MTP layer loaded"; return false; }
+    cudaStream_t s = stream_;
+    cudaMemcpyAsync(d2_tok_, &d1, sizeof(int32_t), cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync(d2_pos_, &pos, sizeof(int32_t), cudaMemcpyHostToDevice, s);
+    if (!draft2_graph_) {
+        cudaGraph_t graph = nullptr;
+        if (!cuda_ok(cudaStreamSynchronize(s), "draft2 inputs", err) ||
+            !cuda_ok(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal), "draft2 capture", err))
+            return false;
+        mtp_layer_enqueue(mtp2_, mtp2_kv_, mtp2_attn_, d2_tok_, d2_pos_, hd_, mres2_, 1, true);
+        if (!cuda_ok(cudaStreamEndCapture(s, &graph), "draft2 end capture", err)) return false;
+        const cudaError_t st = cudaGraphInstantiate(&draft2_graph_, graph, 0);
+        cudaGraphDestroy(graph);
+        if (!cuda_ok(st, "draft2 instantiate", err)) return false;
+    }
+    if (!cuda_ok(cudaGraphLaunch(draft2_graph_, s), "draft2 launch", err)) return false;
+    cudaMemcpyAsync(d2, next_, sizeof(int32_t), cudaMemcpyDeviceToHost, s);
+    return cuda_ok(cudaStreamSynchronize(s), "draft2", err);   // d1, pos and d2 are the caller's
 }
 
 bool MimoDecoder::mtp_forward(const int32_t* tokens, int T, int pos0, int32_t* draft, std::string& err) {

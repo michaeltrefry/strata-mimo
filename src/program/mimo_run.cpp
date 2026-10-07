@@ -43,6 +43,7 @@ int main(int argc, char** argv) {
         else if (a == "--graph") cfg.graph = std::atoi(argv[i + 1]) != 0;
         else if (a == "--profile-gpu") cfg.profile_gpu = std::atoi(argv[i + 1]) != 0;
         else if (a == "--mtp") cfg.mtp_path = argv[i + 1];
+        else if (a == "--mtp-heads") cfg.mtp_heads = std::atoi(argv[i + 1]);
         else if (a == "--batched") cfg.batched_prefill = std::atoi(argv[i + 1]) != 0;
         else if (a == "--adapt") cfg.adapt_weight = std::strtof(argv[i + 1], nullptr);
         else if (a == "--adapt-decode") cfg.adapt_decode = std::atoi(argv[i + 1]) != 0;
@@ -107,31 +108,40 @@ int main(int argc, char** argv) {
             // verify [tok, d] at pos: the main model's prediction after tok decides whether d stands; the MTP layer
             // then takes the accepted positions (and drafts the next d from the last of them)
             int32_t d = draft[last];
+            const bool two = dec.has_mtp2();
             while ((int) out.size() < generate) {
-                int32_t win[2] = {tok, d};
+                int32_t d2 = 0;
+                if (two) {
+                    const auto m1 = clk::now();
+                    const bool ok2 = dec.mtp_draft2(d, pos + 1, &d2, err);
+                    ms_mtp += std::chrono::duration<double, std::milli>(clk::now() - m1).count();
+                    if (!ok2) {
+                        std::fprintf(stderr, "FAIL (draft 2) at %d: %s\n", pos, err.c_str());
+                        return 1;
+                    }
+                }
+                int32_t win[3] = {tok, d, d2};
+                const int W = two ? 3 : 2;
                 const auto m0 = clk::now();
-                const bool ok_main = dec.forward(win, 2, pos, next, nullptr, err);
+                const bool ok_main = dec.forward(win, W, pos, next, nullptr, err);
                 ms_main += std::chrono::duration<double, std::milli>(clk::now() - m0).count();
                 if (!ok_main) {
                     std::fprintf(stderr, "FAIL at %d: %s\n", pos, err.c_str());
                     return 1;
                 }
                 ++windows;
-                int32_t mt[2];
-                int A;
+                // the main model's picks decide: keep drafts while they agree, then its own next token
+                int A = 1;
                 out.push_back(tok);
-                if (next[0] == d) {
-                    out.push_back(d);
+                while (A < W && next[A - 1] == win[A]) {
+                    out.push_back(win[A]);
                     ++accepted;
-                    mt[0] = d;
-                    mt[1] = next[1];
-                    tok = next[1];
-                    A = 2;
-                } else {
-                    mt[0] = next[0];
-                    tok = next[0];
-                    A = 1;
+                    ++A;
                 }
+                tok = next[A - 1];
+                int32_t mt[3];
+                for (int j = 1; j < A; ++j) mt[j - 1] = win[j];
+                mt[A - 1] = tok;
                 const auto m1 = clk::now();
                 const bool ok_mtp = dec.mtp_forward(mt, A, pos + 1, draft, err);
                 ms_mtp += std::chrono::duration<double, std::milli>(clk::now() - m1).count();
@@ -164,8 +174,8 @@ int main(int argc, char** argv) {
                         (double) (st.staged - before.staged) / generate, (st.cpu_ms - before.cpu_ms) / generate,
                         (st.wait_ms - before.wait_ms) / generate);
             if (mtp)
-                std::printf("MTP: %d windows, %d drafts accepted (%.1f%%), %.2f tokens per window\n", windows, accepted,
-                            100.0 * accepted / std::max(windows, 1), (double) generate / std::max(windows, 1));
+                std::printf("MTP: %d windows, %d drafts accepted (%.1f%% of windows' drafts), %.2f tokens per window\n", windows, accepted,
+                            100.0 * accepted / std::max(windows * (dec.has_mtp2() ? 2 : 1), 1), (double) generate / std::max(windows, 1));
             if (mtp)
                 std::printf("per window: main %.2f ms, MTP %.2f ms\n", ms_main / std::max(windows, 1),
                             ms_mtp / std::max(windows, 1));

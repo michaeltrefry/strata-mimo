@@ -40,6 +40,7 @@ struct DecoderConfig {
     bool graph = true;              // v2: one CUDA graph per window size, the CPU handoff inside it (no dump)
     bool profile_gpu = false;       // v2: GPU timestamps per layer (print_profile)
     std::string mtp_path;           // the MTP GGUF (mtp-*.gguf): enables mtp_forward (draft head = its first layer)
+    int mtp_heads = 1;              // 2: also the second nextn layer, for a second draft token (mtp_draft2)
     bool batched_prefill = true;    // prompts of more than 64 tokens through the batched path (src/mimo/prefill.cpp)
     int prefill_slice = 16384;       // tokens per layer-major slice (each non-resident expert copied once per slice)
     int prefill_tile = 2048;        // tokens per attention / dense GEMM tile within a slice
@@ -85,6 +86,11 @@ public:
     /// greedy prediction for each position + 1 to draft[t]; it also fills the layer's own KV (sliding window).
     bool mtp_forward(const int32_t* tokens, int T, int pos0, int32_t* draft, std::string& err);
     bool has_mtp() const { return mtp_arena_ != nullptr; }
+    bool has_mtp2() const { return mtp2_arena_ != nullptr; }
+    /// The second draft: the second nextn layer at position `pos` with token d1 (the first layer's draft from the last
+    /// mtp_forward) and that layer's state at its last row.  Its KV entry is in the draft region and is rewritten by
+    /// the next mtp_forward over accepted positions.
+    bool mtp_draft2(int32_t d1, int pos, int32_t* d2, std::string& err);
 
     /// The prompt tokens[0..n) at positions pos0.. (the KV before pos0 must hold the same tokens), then, with MTP,
     /// the MTP layer's KV over the same positions.  `choose(logits of the last position, its greedy id)` picks the
@@ -121,7 +127,11 @@ private:
     // decode-time residency (v2): the picks of each window, commits of finished background copies, new copies
     void adapt_count(int l, const int32_t* ids, int n);
     bool adapt_window(int T, std::string& err);
+    struct MtpLayer;
     bool load_mtp(std::string& err);
+    bool load_mtp_layer(int k, MtpLayer& m, void*& arena, AttnKv& kv, AttnLayer& al, std::string& err);
+    void mtp_layer_enqueue(const MtpLayer& m, const AttnKv& kv, const AttnLayer& al, const int32_t* tok,
+                           const int32_t* pos, const float* hsrc, float* mres, int T, bool head);
     void mtp_enqueue(int T);
     bool capture(int T, std::string& err);
     void release_gpu_waits();
@@ -177,11 +187,15 @@ private:
     struct MtpLayer {
         DevTensor eh_proj, enorm, hnorm, attn_norm, attn_qkv, attn_output, attn_sinks, ffn_norm, ffn_gate, ffn_up,
             ffn_down, out_norm;
-    } mtp_;
+    } mtp_, mtp2_;
     void* mtp_arena_ = nullptr;
-    AttnKv mtp_kv_{};
-    AttnLayer mtp_attn_{};
+    void* mtp2_arena_ = nullptr;
+    AttnKv mtp_kv_{}, mtp2_kv_{};
+    AttnLayer mtp_attn_{}, mtp2_attn_{};
     cudaGraphExec_t mtp_graphs_[9] = {};
+    cudaGraphExec_t draft2_graph_ = nullptr;
+    float *mres2_ = nullptr, *hd_ = nullptr;   // the second layer's residual; the first layer's last row
+    int32_t *d2_tok_ = nullptr, *d2_pos_ = nullptr;
     float *e_ = nullptr, *cat_ = nullptr, *mres_ = nullptr;
     int32_t *mtp_tok_ = nullptr, *mtp_pos0_ = nullptr;
     // the batched prompt path's buffers (slice S, tile P)
