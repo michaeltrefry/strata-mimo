@@ -1,5 +1,7 @@
 #include "strata/mimo/router.hpp"
 
+#include <cublas_v2.h>
+
 #include <cfloat>
 #include <climits>
 
@@ -108,6 +110,13 @@ void router_logits(const float* w, const float* h, float* logits, int T, int n_e
 #undef STRATA_ROUTER_T
         default: break;
     }
+}
+
+void router_logits_batched(void* cublas, const float* w, const float* h, float* logits, int T, int n_embd, int n_expert) {
+    // column-major view: logits^T [n_expert x T] = W^T [n_expert x n_embd] . H [n_embd x T]
+    const float one = 1.f, zero = 0.f;
+    cublasSgemm((cublasHandle_t) cublas, CUBLAS_OP_T, CUBLAS_OP_N, n_expert, T, n_embd, &one, w, n_embd, h, n_embd, &zero,
+                logits, n_expert);
 }
 
 void router_topk(const float* logits, const float* bias, int* ids, float* weights, int T, int n_expert, int n_used,

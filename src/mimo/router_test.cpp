@@ -10,6 +10,7 @@
 #include "strata/mimo/model.hpp"
 #include "strata/mimo/router.hpp"
 
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -188,6 +189,47 @@ int main(int argc, char** argv) {
         }
         std::printf("against llama.cpp (%d tokens x %d layers): %d of %d expert sets differ, largest weight difference %.2e\n",
                     n_tok, g.count_moe(), set_diff, total, worst_ref_w);
+        // the batched router (prompt chunks) on all dumped tokens at once: its picks against the T <= 8 kernel's
+        {
+            cublasHandle_t cb;
+            cublasCreate(&cb);
+            float* d_all = nullptr;
+            float* d_lg = nullptr;
+            int *d_id1 = nullptr;
+            float* d_w1 = nullptr;
+            cudaMalloc(&d_all, sizeof(float) * x.size());
+            cudaMalloc(&d_lg, sizeof(float) * (size_t) n_tok * N);
+            cudaMalloc(&d_id1, sizeof(int) * (size_t) n_tok * K);
+            cudaMalloc(&d_w1, sizeof(float) * (size_t) n_tok * K);
+            int batched_diff = 0;
+            for (int l : {1, 24, 47}) {
+                const std::string L = std::to_string(l), b = "blk." + L + ".";
+                load("ffn_norm-" + L + ".f32", x.size() * 4, x.data());
+                cudaMemcpy(d_w, model.host_data(b + "ffn_gate_inp.weight"), sizeof(float) * E * N, cudaMemcpyHostToDevice);
+                cudaMemcpy(d_b, model.host_data(b + "exp_probs_b.bias"), sizeof(float) * N, cudaMemcpyHostToDevice);
+                cudaMemcpy(d_all, x.data(), sizeof(float) * x.size(), cudaMemcpyHostToDevice);
+                router_logits_batched(cb, d_w, d_all, d_lg, n_tok, E, N);
+                router_topk(d_lg, d_b, d_id1, d_w1, n_tok, N, K, g.expert_weights_scale, nullptr);
+                std::vector<int> big((size_t) n_tok * K);
+                cudaMemcpy(big.data(), d_id1, sizeof(int) * big.size(), cudaMemcpyDeviceToHost);
+                for (int t0 = 0; t0 < n_tok; t0 += kRouterMaxT) {
+                    const int T = std::min(kRouterMaxT, n_tok - t0);
+                    cudaMemcpy(d_h, x.data() + (size_t) t0 * E, sizeof(float) * T * E, cudaMemcpyHostToDevice);
+                    router_logits(d_w, d_h, d_logits, T, E, N, nullptr);
+                    router_topk(d_logits, d_b, d_ids, d_wt, T, N, K, g.expert_weights_scale, nullptr);
+                    std::vector<int> small((size_t) T * K);
+                    cudaMemcpy(small.data(), d_ids, sizeof(int) * small.size(), cudaMemcpyDeviceToHost);
+                    for (int t = 0; t < T; ++t)
+                        batched_diff += std::set<int>(small.begin() + t * K, small.begin() + (t + 1) * K) !=
+                                        std::set<int>(big.begin() + (size_t) (t0 + t) * K, big.begin() + (size_t) (t0 + t + 1) * K);
+                }
+            }
+            std::printf("batched router (cuBLAS SGEMM, %d tokens at once) vs the T <= 8 kernel, layers 1/24/47: %d of %d "
+                        "expert sets differ\n", n_tok, batched_diff, 3 * n_tok);
+            ok = ok && batched_diff * 1000 <= 3 * n_tok;
+            cudaFree(d_all); cudaFree(d_lg); cudaFree(d_id1); cudaFree(d_w1);
+            cublasDestroy(cb);
+        }
         std::printf("  of those, exact (double) arithmetic picks this router's set %d times, llama.cpp's %d, neither %d\n",
                     mine_exact, ref_exact, neither_exact);
         ok = ok && ref_exact == 0;   // llama.cpp may round its router (cuBLAS); this one must not be the one that is off
