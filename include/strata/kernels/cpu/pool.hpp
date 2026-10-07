@@ -114,6 +114,8 @@ std::vector<int> physical_cores(bool skip_first, PoolAffinity affinity = PoolAff
 ///
 /// Returns the PREVIOUS affinity mask, or -1 if the platform refused; pass it to `restore_thread_affinity`.
 long long pin_current_thread(int core);
+/// STRATA_POOL_PRIORITY=high: raise the calling thread's priority and take it out of power throttling (Windows).
+void raise_thread_priority();
 void restore_thread_affinity(long long previous);
 
 class ExpertPool {

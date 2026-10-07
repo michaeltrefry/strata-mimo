@@ -10,6 +10,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -278,6 +279,25 @@ void pin_this_thread(int core) {
 
 }  // namespace
 
+// STRATA_POOL_PRIORITY=high: the calling thread at THREAD_PRIORITY_HIGHEST and out of Windows' power throttling
+// (EcoQoS), so a busy desktop or the power manager does not stall one worker of a layer's experts and with it the
+// whole layer.  Off unless asked (it competes harder with everything else on the PC).
+void raise_thread_priority() {
+    static const bool high = [] {
+        const char* e = std::getenv("STRATA_POOL_PRIORITY");
+        return e && std::string(e) == "high";
+    }();
+    if (!high) return;
+#if defined(_WIN32)
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    THREAD_POWER_THROTTLING_STATE pt{};
+    pt.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+    pt.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+    pt.StateMask = 0;   // not throttled
+    SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &pt, sizeof pt);
+#endif
+}
+
 long long pin_current_thread(int core) {
     if (core < 0) return -1;
 #if defined(_WIN32)
@@ -367,6 +387,7 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
         const int core = pin ? (i < (int) topo_.worker_cores.size() ? topo_.worker_cores[(size_t) i] : -1) : -1;
         threads_.emplace_back([this, i, core] {
             pin_this_thread(core);
+            raise_thread_priority();
             worker(i);
         });
     }

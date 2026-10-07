@@ -156,6 +156,7 @@ bool MimoDecoder::init(std::string& err) {
             const cpu::CpuTopology topo = cpu::detect_cpu_topology(true);
             if (topo.host_core >= 0) prev_affinity_ = cpu::pin_current_thread(topo.host_core);   // the host works too
         }
+        cpu::raise_thread_priority();   // the host loop works in the pool too
         cpu_ = std::make_unique<CpuExperts>(model_, *pool_);   // the RAM copy is made at the end of init
         const size_t act = (size_t) kMaxT * E * 4, small = (size_t) kMaxT * kRouterMaxUsed * 4;
         if (!cuda_ok(cudaMallocHost(&h_host_, act), "pinned", err) || !cuda_ok(cudaMallocHost(&cpu_out_host_, act), "pinned", err) ||
