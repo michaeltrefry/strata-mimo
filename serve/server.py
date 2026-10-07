@@ -2889,7 +2889,10 @@ def main() -> int:
             tokens[i] = t
         merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
         types = json.loads((tpath / "token_type.json").read_text())
-        tok = ST.Tokenizer(tokens, merges, types)
+        pre = "qwen35"   # the pre-tokenizer the model declares (tokenizer.json, written by strata_tokenizer.extract)
+        if (tpath / "tokenizer.json").exists():
+            pre = json.loads((tpath / "tokenizer.json").read_text(encoding="utf-8")).get("pre", pre)
+        tok = ST.Tokenizer(tokens, merges, types, pre)
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
     if a.engine == "strata":
         if not cfg:

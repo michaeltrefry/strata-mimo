@@ -271,6 +271,7 @@ class Event:
     call: ToolCall | None = None
 
 
+THINK_START = "<think>"
 THINK_END = "</think>"
 CALL_START = "<tool_call>"
 CALL_END = "</tool_call>"
@@ -372,6 +373,9 @@ class OutputParser:
         self.state = "reasoning" if thinking else "content"
         self.buf = ""
         self.lead = False
+        # MiMo's chat template leaves `<think>` to the model (Qwen3.8's writes it into the prompt): an opening tag
+        # at the very start of the reasoning is the block's own, not text to show
+        self.opening = thinking
         self.schemas = {t.get("name"): t for t in tools or []}
         # stream_tools: a tool call is also reported while it is being written - "tool_start" (its name and id) as
         # soon as the name is known, then "tool_args" pieces of its JSON arguments (string parameters character by
@@ -504,6 +508,15 @@ class OutputParser:
         self.buf += delta
         out: list[Event] = []
         while True:
+            if self.state == "reasoning" and self.opening:
+                lead = self.buf.lstrip()
+                if THINK_START.startswith(lead):        # nothing yet, or a partial `<think>`: wait
+                    if lead == THINK_START:
+                        self.buf, self.opening = "", False
+                    return out
+                if lead.startswith(THINK_START):
+                    self.buf = lead[len(THINK_START):]
+                self.opening = False
             if self.state == "reasoning":
                 i = self.buf.find(THINK_END)
                 if i < 0:

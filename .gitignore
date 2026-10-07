@@ -53,3 +53,4 @@ build-vision.bat
 /.rocm-win/
 build-mimo.bat
 build-*.log
+.venv/
