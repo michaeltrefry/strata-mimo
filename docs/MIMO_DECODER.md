@@ -60,6 +60,8 @@ busy wait (the CPU's mean per layer) at 77.3 tok/s.
 ## Next
 
 - Prompt processing: 188 tok/s comes from running the prompt through 8-token decode windows; long prompts (a
-  50K-token coding context would take over 4 minutes) need the batched prefill path (GEMM + MXFP4 MMQ).
+  50K-token coding context would take over 4 minutes) need the batched prefill path (GEMM + MXFP4 MMQ).  Its MoE part
+  is done: [MIMO_PREFILL_MOE.md](MIMO_PREFILL_MOE.md) (444-3,091 tok/s for the experts at 512-4,096-token chunks,
+  bound by the PCIe copies of the non-resident experts).
 - The server (serve/), setup, and an expert profile from the user's own sessions.
 - The CPU's slow layers and an adaptive expert cache (LRU measured at 92% vs 84-90% static).

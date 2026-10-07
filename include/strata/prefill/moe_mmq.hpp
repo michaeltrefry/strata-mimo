@@ -13,7 +13,8 @@ namespace strata::prefill::mmq {
 /// This build has the MMQ path (the ggml sources were available to the build).
 bool built();
 /// MMQ covers this ggml type (the i-quants and Q2_0 the packs use, Q8_0, and in a CUDA build with STRATA_MMQ_KQUANTS
-/// the Q4_K / Q5_K / Q5_1 of Unsloth's UD-Q4_K_XL; IQ1_M is not covered).
+/// the Q4_K / Q5_K / Q5_1 of Unsloth's UD-Q4_K_XL, with STRATA_MMQ_MXFP4 (CUDA builds) MXFP4; IQ1_M is not covered).
+/// MXFP4 on a Blackwell GPU is llama.cpp's FP4 x FP4 path: `quantize` then writes FP4 activations, not q8_1.
 bool supported(int ggml_type);
 /// #420: `supported`, and on every visible GPU llama.cpp's MMQ has a tile for this type and a weight matrix of
 /// `w_rows` rows that fits the card's shared memory - the same test its tile choice makes, which aborts the process

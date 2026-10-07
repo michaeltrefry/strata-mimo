@@ -114,6 +114,9 @@ bool supported(int t) {
         case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S:
         case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ4_NL: case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_Q8_0:   // the draft layer's dense matrices (E-9)
+#ifdef STRATA_MMQ_MXFP4
+        case GGML_TYPE_MXFP4:  // MiMo's experts; on sm_120 the activations become FP4 (docs/MIMO_PREFILL_MOE.md)
+#endif
 #ifdef STRATA_MMQ_KQUANTS
         case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q5_1:   // Unsloth's UD-Q4_K_XL experts (CUDA)
 #endif
@@ -161,6 +164,15 @@ size_t q8_bytes(int64_t rows, int64_t cols) {
 
 void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols, int64_t ld, int64_t rows, void* stream) {
     if (rows <= 0) return;
+#ifdef STRATA_MMQ_MXFP4
+    // llama.cpp's choice (mmq.cu): on a GPU with Blackwell's FP4 MMA, MXFP4 weights take FP4 activations
+    if ((ggml_type) t == GGML_TYPE_MXFP4 && blackwell_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+        quantize_mmq_fp4_cuda(x, ids, xq, nullptr, (ggml_type) t, false, cols, ld, rows * ld, rows * ld, pad512(cols),
+                              rows, 1, 1, (cudaStream_t) stream);
+        ck(cudaGetLastError(), "quantize fp4");
+        return;
+    }
+#endif
     quantize_mmq_q8_1_cuda(x, ids, xq, (ggml_type) t, cols, ld, rows * ld, rows * ld, pad512(cols), rows, 1, 1,
                            (cudaStream_t) stream);
     ck(cudaGetLastError(), "quantize");
@@ -197,6 +209,9 @@ void Context::run(const Product& p, void* stream) {
         case GGML_TYPE_IQ4_NL: mul_mat_q_case<GGML_TYPE_IQ4_NL>(ctx, a, s); break;
         case GGML_TYPE_IQ4_XS: mul_mat_q_case<GGML_TYPE_IQ4_XS>(ctx, a, s); break;
         case GGML_TYPE_Q8_0: mul_mat_q_case<GGML_TYPE_Q8_0>(ctx, a, s); break;
+#ifdef STRATA_MMQ_MXFP4
+        case GGML_TYPE_MXFP4: mul_mat_q_case<GGML_TYPE_MXFP4>(ctx, a, s); break;
+#endif
 #ifdef STRATA_MMQ_KQUANTS
         case GGML_TYPE_Q4_K: mul_mat_q_case<GGML_TYPE_Q4_K>(ctx, a, s); break;
         case GGML_TYPE_Q5_K: mul_mat_q_case<GGML_TYPE_Q5_K>(ctx, a, s); break;
