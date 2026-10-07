@@ -31,6 +31,10 @@ answers, no questions), --setup (install another model / change settings instead
 engine), --check (only check this PC), --resident-budget-gib N (UD-Q4_K_XL's experts in RAM), --kv-streaming
 on|off|auto.
 
+--family mimo installs MiMo-V2.6-Flash-RL instead (docs/MIMO.md): 192 GB of RAM, one NVIDIA card with 32 GB of VRAM
+or more; its engine, strata-mimo, is compiled here.  --dry-run (MiMo only for now) says what setup would do and
+changes nothing.
+
 Setup recommends, it never forces: the recommended answers are the defaults (--yes, or Enter), and a bigger choice
 than it recommends - a longer context, more GPUs, a bigger RAM budget, a size it thinks will not fit - is kept, with
 what it risks.  With --yes, an explicit flag (--model, --gpus, ...) is the consent to a risk setup would otherwise
@@ -67,6 +71,7 @@ HF_REVISIONS = {
     "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "b22d729eae29b5796f76fb70f91aef549b9fc52c",   # 2026-09-24
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF": "5348543e0147355ac9cbcb031184a3546350988e",  # 2026-09-29
     "unsloth/Qwen3.8-Flash-Next-GGUF": "38bb39ee97821de2c9009abb7e93950eec396e66",                   # 2026-09-30
+    "ggml-org/MiMo-V2.6-Flash-RL-GGUF": "a5d1269fdcf9c3346934411f700038e9cd9d5102",                  # 2026-10-06
 }
 
 
@@ -128,6 +133,10 @@ MODELS = {
     "UD-Q4_K_XL": {"about": "4-bit (Unsloth Dynamic), EXPERIMENTAL: the best quality, but most experts come from the "
                             "SSD on a 64 GB PC (7-8.5 tokens/s measured)", "download_gb": 111.3, "ram_gb": 48,
                    "arena_gb": 77.0, "families": ("unsloth",), "budget": True},
+    # MiMo-V2.6-Flash-RL (docs/MIMO.md): ggml-org's MXFP4 GGUF and its Q8_0 MTP file; its engine (strata-mimo) keeps a
+    # pinned copy of all the experts in RAM (~150 GB measured), so it needs 192 GB
+    "MXFP4": {"about": "MiMo's only size: MXFP4 experts, a Q8_0 MTP layer", "download_gb": 169.8,
+              "ram_gb": 192, "arena_gb": 150.0, "families": ("mimo",)},
 }
 # The experimental Unsloth file's four shards at the pinned revision: name -> (bytes, sha256), checked after the
 # download (setup trusts no other model file by name and size alone either: check_shards reads their directories).
@@ -181,7 +190,32 @@ FAMILIES = {
                 "mmproj_hf": hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"),
                 "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "name": "qwen3.8-flash-next-unsloth",
                 "experimental": True, "vision": False, "pack_args": ["--compat-bf16"], "sha256": UNSLOTH_SHARDS},
+    # Xiaomi's MiMo-V2.6-Flash-RL (309B, 15B active): another model AND another engine, strata-mimo, compiled here for
+    # one NVIDIA card (install_mimo, docs/MIMO.md).  For coding; no images
+    "mimo": {"title": "MiMo-V2.6-Flash-RL", "by": "Xiaomi; MXFP4 GGUF by ggml-org",
+             "about": "309B (15B active), for code: needs 192 GB of RAM and an NVIDIA card with 32 GB+ (measured on 96 GB)",
+             "hf": hf("ggml-org/MiMo-V2.6-Flash-RL-GGUF"), "repo": "ggml-org/MiMo-V2.6-Flash-RL-GGUF",
+             "file": "MiMo-V2.6-Flash-RL-{q}-0000{i}-of-00002.gguf", "tag": "mimo-", "name": "mimo-v2.6-flash-rl",
+             "experimental": True, "vision": False, "engine": "mimo", "profile": "mimo-coding-answers.prof"},
 }
+# MiMo's three files at the pinned revision: name -> (bytes, sha256).  Shard 1 is --native (the engine opens shard 2
+# itself), the MTP file is --mtp.
+MIMO_FILES = {
+    "MiMo-V2.6-Flash-RL-MXFP4-00001-of-00002.gguf":
+        (5948640, "a34f63df32086bba7a14aa8a2f6c2f111f6e626ad7b10be18957e42d14d84738"),
+    "MiMo-V2.6-Flash-RL-MXFP4-00002-of-00002.gguf":
+        (167363516512, "10b74ff85577de18b336718c19905a50bcbccfee9cae7b9edd446667084f623c"),
+    "mtp-MiMo-V2.6-Flash-RL-Q8_0.gguf":
+        (2383728864, "cbcd8a22e62754b4133dc6f9ba87356268aa2d6377ee3e78be5d61172643969e"),
+}
+MIMO_RAM_GB = 192             # the engine's pinned copy of the experts is ~150 GB (measured), plus the OS and the rest
+MIMO_VRAM_MIN_GB = 32         # below: refused (6 GB of other weights, ~3 GB KV at 256K, ~2.5 GB prompt buffers, experts)
+MIMO_VRAM_MEASURED_GB = 96    # every MiMo number was measured on a 96 GB RTX PRO 6000
+MIMO_FULL_CTX_VRAM_GB = 80    # the 256K context by default from here, else 64K
+MIMO_MAX_CTX = 262144
+MIMO_CONTEXTS = [32768, 65536, 131072, 262144]
+MIMO_EXE = "strata-mimo.exe" if WIN else "strata-mimo"
+MIMO_MIN_CUDA = (12, 8)       # MiMo's engine was built with CUDA 12.9 for every measurement (docs/MIMO.md)
 MMPROJ = "mmproj-Qwen3.8-Flash-Next-BF16.gguf"
 # EXPERIMENTAL, off by default (setup asks): a control vector shipped with the repository, see its README
 ESP_VECTOR = ROOT / "data" / "experimental-speed-projection" / "Qwen3.8-Flash-Next-experimental-speed-projection.gguf"
@@ -1832,8 +1866,9 @@ def update_installed_engine(url_base) -> None:
     pip_install(CUDA_WHEELS, "NVIDIA CUDA libraries (cuBLAS, CUDA runtime; ~0.4 GB)")
 
 
-def install_build_tools(gpu, yes):
-    """The compiler and the CUDA toolkit, installed for the user (asks once).  Returns (nvcc, vcvars)."""
+def install_build_tools(gpu, yes, need=None):
+    """The compiler and the CUDA toolkit, installed for the user (asks once).  Returns (nvcc, vcvars).  need: the
+    oldest CUDA version that will do (default: 13.0 for RTX 50 cards, else 12.0)."""
     archs = [int(x) for x in gpu.get("archs", [gpu["arch"]])]
     # #295: Pascal / Volta (STRATA_EXPERIMENTAL_SM60=1) need a CUDA 12.x toolkit - CUDA 13 cannot build sm_60/sm_70
     old = min(archs) < 75
@@ -1847,7 +1882,7 @@ def install_build_tools(gpu, yes):
              "install CUDA 12.9 (or another 12.x; it can sit next to a newer one) from "
              "https://developer.nvidia.com/cuda-toolkit-archive and run it again")
     # RTX 50 (sm_120): CUDA 13.0 - an engine built with 12.8 crashed in the prompt path on Linux (#220)
-    need_cuda = (13, 0) if max(archs) >= 120 else (12, 0)
+    need_cuda = need or ((13, 0) if max(archs) >= 120 else (12, 0))
     vcvars = find_vcvars() if WIN else None
     have_cc = vcvars is not None if WIN else shutil.which("g++") is not None
     missing = []
@@ -2497,6 +2532,9 @@ def calibrate_config(cfg_path: Path) -> bool:
     sys.path.insert(0, str(ROOT / "tools"))
     import calibrate as CAL
     cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+    if is_mimo(cfg):                                   # tools/calibrate.py tunes Strata's own engine's settings
+        warn("there is no tuning for MiMo's engine yet: its settings stay as they are")
+        return False
     say()
     say("  Tuning Strata for this PC: the output speed is measured with a few engine settings (the PCIe share, the")
     say("  draft depth, the CPU threads). It takes about 5-10 minutes; the PC is busy meanwhile.")
@@ -2574,7 +2612,9 @@ def update_install(have: list, a) -> int:
         update_installed_engine(a.prebuilt)
     for cfg_path in have:
         cfg = upgrade_config(cfg_path, json.loads(cfg_path.read_text(encoding="utf-8-sig")))
-        if "--mtp" in cfg["args"][:-1]:
+        if is_mimo(cfg):                               # its own engine, compiled here: again when its source changed
+            update_mimo_engine(cfg)
+        elif "--mtp" in cfg["args"][:-1]:
             refresh_draft_vocab(Path(cfg["args"][cfg["args"].index("--mtp") + 1]), cfg.get("draft_vocab", "cjk"))
         if cfg.get("backend") == "hip" and WIN:
             hip_runtime_beside_exe(Path(cfg["exe"]).parent)   # #468 #461
@@ -2633,11 +2673,23 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
         ok("saved for this model: " + ", ".join("api key" if k == "api_key" else f"{k.replace('_', ' ')} {v}"
                                                 for k, v in keep.items()))
     cfg_path.touch()                                     # the most recently used model
-    if "--mtp" in cfg["args"][:-1]:
+    if "--mtp" in cfg["args"][:-1] and not is_mimo(cfg):   # (MiMo's --mtp is its GGUF file: no draft subset)
         refresh_draft_vocab(Path(cfg["args"][cfg["args"].index("--mtp") + 1]), cfg.get("draft_vocab", "cjk"))
     cmd = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata", "--config", str(cfg_path),
            "--port", str(port or cfg.get("port", 8080))]
-    if cfg.get("backend") == "hip":                    # AMD, numbered as HIP numbers them (setup's KFD order)
+    if is_mimo(cfg):                                   # one NVIDIA card, its own engine (docs/MIMO.md)
+        if isinstance(gpu, list):
+            fail("MiMo's engine runs on one GPU", "start it on one card: --gpu N")
+        update_mimo_engine(cfg, yes)
+        found = gpus()
+        use = gpu if gpu is not None else cfg.get("gpu")
+        if gpu is not None:                            # --gpu N: this start only, on that card
+            check_gpus([gpu], found)
+            cmd += ["--gpu", str(gpu)]
+        g = next((x for x in found if x["index"] == use), None)
+        if g is not None:
+            ok("GPU: " + gpu_name(g))
+    elif cfg.get("backend") == "hip":                  # AMD, numbered as HIP numbers them (setup's KFD order)
         if WIN:
             hip_runtime_beside_exe(Path(cfg["exe"]).parent)   # #468 #461: also fixes a 0.1.34 install
         amd = amd_gpus()
@@ -2668,7 +2720,7 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
                 ok(f"GPU: {g['name']} ({g['vram_gb']:.0f} GB, AMD)")
     else:
         found = gpus()
-    if cfg.get("backend") == "hip":
+    if cfg.get("backend") == "hip" or is_mimo(cfg):
         pass
     elif isinstance(gpu, list):                        # --gpus: saved, this model runs on these cards from now on
         check_gpus(gpu, found, yes=yes, named=True)
@@ -2686,7 +2738,7 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
     # #364 #384: a resident low-RAM config on several GPUs; #498: a UD-Q4_K_XL config with its RAM budget (by hand)
     if isinstance(use, list) and (split_mmap(cfg) | split_budget(cfg)):
         write_config(cfg_path, cfg)
-    if cfg.get("backend") == "hip":
+    if cfg.get("backend") == "hip" or is_mimo(cfg):
         pass
     elif isinstance(use, list):
         check_gpus(use, found, "(chosen for this model) ", yes=True, named=True)
@@ -2710,6 +2762,8 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
     say()
     say("  " + "-" * 100)
     size = f'about {gb:.0f} GB' if gb >= 1 else '34-55 GB'
+    if is_mimo(cfg):                                   # its shard 1 is 6 MB: the experts are in shard 2
+        size = f"about {MODELS['MXFP4']['arena_gb']:.0f} GB of experts (~70 s, measured)"
     a_ = cfg["args"]
     if "--mmap-experts" in a_ and "--resident-budget-gib" not in a_ and "--resident-experts" not in a_:
         # #505: the mapped low-RAM mode loads nothing into RAM up front (the server's narrator says the same)
@@ -2879,6 +2933,419 @@ def write_run_script(model, cfg_path, port):
     return script
 
 
+# ------------------------------------------------------------------------------------------------ MiMo-V2.6-Flash-RL
+# docs/MIMO.md: another model with its own engine (src/program/mimo_serve.cpp, the CMake target strata-mimo) behind the
+# same server.  Setup checks the PC, compiles strata-mimo for the card, gets the three files (a complete copy already on
+# the PC is used: another Strata folder, --gguf-dir, or Hugging Face's own download cache), checks their SHA-256,
+# extracts the tokenizer and writes strata-mimo-mxfp4.json.  NVIDIA only: the MXFP4 expert kernels are CUDA.
+def is_mimo(cfg: dict) -> bool:
+    """A MiMo run config (setup writes "family": "mimo" into it)."""
+    return isinstance(cfg, dict) and cfg.get("family") == "mimo"
+
+
+def mimo_problem(ram: float, vram_gb: float, hip: bool) -> str | None:
+    """Why MiMo cannot be installed on this PC, or None."""
+    if hip:
+        return "MiMo's engine is NVIDIA-only for now (its MXFP4 expert kernels are CUDA; there is no AMD build)"
+    if ram < MIMO_RAM_GB - 4:                          # ram_gb() reads a little under the label (192 GB: ~191.7)
+        return (f"RAM: {ram:.0f} GB - MiMo needs {MIMO_RAM_GB} GB or more: its engine keeps a pinned copy of all the "
+                "experts in RAM (~150 GB, measured)")
+    if vram_gb < MIMO_VRAM_MIN_GB - 1:                 # a 32 GB card lists ~31.8
+        return (f"VRAM: {vram_gb:.0f} GB - MiMo needs a card with {MIMO_VRAM_MIN_GB} GB or more (~6 GB of non-expert "
+                "weights, ~3 GB of KV cache at 256K and ~2.5 GB of prompt buffers come before any expert)")
+    return None
+
+
+def mimo_notes(vram_gb: float, arch: str) -> list[str]:
+    """What is unmeasured about MiMo on this card: warnings, nothing is refused."""
+    notes = []
+    if vram_gb < MIMO_VRAM_MEASURED_GB - 6:            # a 96 GB card lists ~95.6
+        notes.append(f"{vram_gb:.0f} GB of VRAM: MiMo was measured only on a 96 GB RTX PRO 6000 (~6,600 of its 12,032 "
+                     "experts on the GPU); with less VRAM fewer experts fit there and the speed is unmeasured")
+    arch = str(arch)
+    if arch != "120":
+        notes.append(f"compute capability {arch[:-1]}.{arch[-1:]}: MiMo's engine was tested on sm_120 (RTX 50, RTX PRO "
+                     "Blackwell) only; it is compiled for this card, but untested there")
+    return notes
+
+
+def mimo_context(asked, vram_gb: float, yes: bool) -> int:
+    """MiMo's context: --context as given (at most 262144: the engine has no rope scaling), else 256K on a card with
+    80 GB or more and 64K below (the 96 GB card runs 256K with 8-bit KV, docs/MIMO.md), asked when interactive."""
+    rec = MIMO_MAX_CTX if vram_gb >= MIMO_FULL_CTX_VRAM_GB else 65536
+    if asked:
+        if asked > MIMO_MAX_CTX:
+            fail(f"--context {asked}: MiMo's engine serves at most {MIMO_MAX_CTX} tokens (it has no rope scaling)",
+                 f"use --context {MIMO_MAX_CTX} or less")
+        return asked
+    say()
+    say("  Context length = how much text the model can see at once. Longer needs more VRAM for it, so fewer experts")
+    say("  fit on the GPU:")
+    for i, c in enumerate(MIMO_CONTEXTS, 1):
+        say(f"  {i}) {c // 1024}K tokens" + ("   (recommended for your GPU)" if c == rec else ""))
+    return MIMO_CONTEXTS[int(ask("Context?", [str(i) for i in range(1, len(MIMO_CONTEXTS) + 1)],
+                                 str(MIMO_CONTEXTS.index(rec) + 1), yes)) - 1]
+
+
+def hf_hub_dirs(env=None) -> list[Path]:
+    """Where huggingface_hub keeps its downloads: HF_HUB_CACHE, HF_HOME/hub, else ~/.cache/huggingface/hub."""
+    env = os.environ if env is None else env
+    dirs = [Path(env[k]) for k in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE") if env.get(k)]
+    if env.get("HF_HOME"):
+        dirs.append(Path(env["HF_HOME"]) / "hub")
+    dirs.append(Path(env.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "huggingface" / "hub")
+    return list(dict.fromkeys(dirs))
+
+
+def hf_cached(repo: str, name: str, env=None) -> Path | None:
+    """`name` of `repo` at its pinned revision in Hugging Face's download cache (huggingface-cli / hf download), or
+    None.  Only the pinned revision's snapshot counts; its size and SHA-256 are checked like a download's."""
+    for hub in hf_hub_dirs(env):
+        p = hub / f"models--{repo.replace('/', '--')}" / "snapshots" / HF_REVISIONS[repo] / name
+        if p.is_file():
+            return p
+    return None
+
+
+def mimo_locate(models_dir: Path, roots: list, tag: str, gguf_dir=None, env=None) -> dict:
+    """name -> where a complete copy of each MiMo file already is (by its size; the SHA-256 is checked later), or None
+    when it has to be downloaded.  In order: the model folder, the same folder of another Strata data folder,
+    --gguf-dir, Hugging Face's download cache at the pinned revision."""
+    found = {}
+    for name, (size, _sha) in MIMO_FILES.items():
+        cands = [models_dir / name, *(r / "models" / tag / name for r in roots)]
+        if gguf_dir:
+            cands.append(Path(gguf_dir) / name)
+        cached = hf_cached(FAMILIES["mimo"]["repo"], name, env)
+        if cached is not None:
+            cands.append(cached)
+        found[name] = None
+        for p in dict.fromkeys(cands):
+            try:
+                if p.is_file() and p.stat().st_size == size:
+                    found[name] = p
+                    break
+            except OSError:
+                continue
+    return found
+
+
+def mimo_adopt(src: Path, dst: Path) -> Path:
+    """A complete MiMo file found outside the model folder: hard-linked into it (the same drive: no copy, and it stays
+    when the other folder or the Hugging Face cache is cleaned), else used where it is - never copied (167 GB)."""
+    if src == dst:
+        return dst
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        os.link(src.resolve(), dst)
+        mark(dst, f"linked from {src}")
+        ok(f"{dst.name}: linked from {src.parent}")
+        return dst
+    except OSError:
+        ok(f"{dst.name}: used where it is, {src.parent} (another drive: not copied)")
+        return src
+
+
+def mimo_verify(path: Path, size: int, sha: str, record: Path) -> bool:
+    """One MiMo file's size and SHA-256 against the pinned values, hashed once: the result is kept in `record` (a JSON
+    file in the model folder - also for a file used in place, whose own folder setup does not write to)."""
+    try:
+        seen = json.loads(record.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        seen = {}
+    st = path.stat()
+    if st.st_size != size:
+        warn(f"{path} is {st.st_size:,} bytes, not {size:,}")
+        return False
+    key = {"size": st.st_size, "mtime": int(st.st_mtime), "sha256": sha}
+    if seen.get(str(path)) == key:
+        return True
+    say(f"  checking {path.name} (SHA-256, {size / 1e9:.1f} GB) ...")
+    h, n, last = hashlib.sha256(), 0, time.time()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(16 << 20)
+            if not b:
+                break
+            h.update(b)
+            n += len(b)
+            if time.time() - last > 5:
+                last = time.time()
+                print(f"\r  {path.name}: {100 * n / size:.0f}%   ", end="", flush=True)
+    if size > 1 << 30:
+        print()
+    if h.hexdigest() != sha:
+        warn(f"{path} has the wrong SHA-256 ({h.hexdigest()}, expected {sha})")
+        return False
+    seen[str(path)] = key
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text(json.dumps(seen, indent=1), encoding="utf-8")
+    return True
+
+
+def mimo_build_defs(arch, nvcc, llama) -> list:
+    """The CMake definitions of the strata-mimo build: CUDA for this card, the pinned ggml (llama.cpp's, as for
+    Strata's own engine; STRATA_NATIVE_EXPERTS builds the CPU experts' ggml kernels)."""
+    return ["-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_BUILD_TESTS=OFF", "-DSTRATA_NATIVE_EXPERTS=ON",
+            f"-DCMAKE_CUDA_ARCHITECTURES={arch}", f"-DCMAKE_CUDA_COMPILER={nvcc}", f"-DSTRATA_GGML_DIR={llama}"]
+
+
+def build_mimo_engine(gpu: dict, yes: bool, llama, dry=False) -> Path:
+    """Compile strata-mimo for this card into engine-mimo/ (build folder build-mimo/, beside Strata's own build/).
+    Compiled again when the engine's source changed (a `git pull`) or for another card; else kept."""
+    eng = ROOT / "engine-mimo"
+    stamp = eng / "BUILD.json"
+    try:
+        meta = json.loads(stamp.read_text())
+    except (OSError, ValueError):
+        meta = {}
+    src, arch = source_hash(ENGINE_SOURCES), int(gpu["arch"])
+    if (eng / MIMO_EXE).exists() and meta.get("src") == src and arch in [int(x) for x in meta.get("archs", [])]:
+        ok(f"MiMo engine already built for this PC: {eng / MIMO_EXE}")
+        return eng
+    if dry:
+        nvcc, ver = find_nvcc()
+        cc_ok = (find_vcvars() is not None) if WIN else shutil.which("g++") is not None
+        say(f"  would compile strata-mimo for sm_{arch} (10-20 minutes) in {ROOT / 'build-mimo'} and copy it to {eng}")
+        say(f"    CUDA toolkit: {nvcc} ({ver[0]}.{ver[1]})" if nvcc and ver >= MIMO_MIN_CUDA else
+            "    CUDA toolkit: " + (f"{ver[0]}.{ver[1]} is too old" if nvcc else "not found") + " (setup would install "
+            "13.0)")
+        say("    C++ compiler: " + ("found" if cc_ok else "not found (setup would install it)"))
+        say("    cmake " + " ".join(mimo_build_defs(arch, nvcc or "<nvcc>", llama)) + " --target strata-mimo")
+        return eng
+    # CUDA 12.8 is the first with sm_120; every MiMo number was measured with an engine built by CUDA 12.9 (Windows)
+    nvcc, vcvars = install_build_tools({**gpu, "archs": [arch]}, yes, MIMO_MIN_CUDA)
+    say("  Compiling MiMo's engine (strata-mimo) for your GPU (10-20 minutes, once) ...")
+    cmake_build(ROOT, ROOT / "build-mimo", "strata-mimo", mimo_build_defs(arch, nvcc, llama), vcvars, "build-mimo.bat")
+    eng.mkdir(exist_ok=True)
+    shutil.copy2(ROOT / "build-mimo" / MIMO_EXE, eng / MIMO_EXE)
+    bindir = Path(nvcc).parent                         # the toolkit's own libraries (bin, bin/x64, lib64)
+    dirs = [str(d) for d in (bindir, bindir / "x64", bindir.parent / "lib64") if d.is_dir()]
+    stamp.write_text(json.dumps({"source": "local", "engine": "mimo", "version": source_version(), "archs": [arch],
+                                 "cuda_dirs": dirs, "src": src}, indent=1))
+    ok(f"MiMo engine compiled: {eng / MIMO_EXE}")
+    return eng
+
+
+def update_mimo_engine(cfg: dict, yes=False) -> None:
+    """A MiMo engine compiled before a `git pull` changed its source is compiled again before it starts (as Strata's
+    own compiled engine is); when that fails, the installed one starts."""
+    try:
+        meta = json.loads((Path(cfg["exe"]).parent / "BUILD.json").read_text())
+    except (OSError, ValueError, KeyError):
+        return
+    if meta.get("engine") != "mimo" or meta.get("src") == source_hash(ENGINE_SOURCES):
+        return
+    try:
+        g = gpu_info(cfg["gpu"] if isinstance(cfg.get("gpu"), int) else None)
+        if g is None:
+            raise RuntimeError("no NVIDIA GPU found")
+        say("  MiMo's engine source changed: compiling it again ...")
+        build_mimo_engine(g, yes, get_llama_cpp())
+    except (Exception, SystemExit) as e:
+        warn(f"could not compile the updated MiMo engine{'' if isinstance(e, SystemExit) else f' ({e})'}: starting "
+             "the installed one")
+
+
+def nearest_dir(path: Path) -> Path:
+    """The folder itself, or its nearest parent that exists (--dry-run creates no folder)."""
+    p = Path(path)
+    while not p.exists() and p.parent != p:
+        p = p.parent
+    return p
+
+
+def free_gb_dry(path: Path) -> float:
+    """free_gb() without creating the folder (--dry-run): the free space of its nearest existing parent."""
+    return shutil.disk_usage(nearest_dir(path)).free / 1e9
+
+
+def data_folder_dry(requested: str | None) -> tuple:
+    """data_folder() without its effects (--dry-run): the data folder it would use and the folders whose model files
+    would be found; nothing is moved and the settings file is not written."""
+    settings = load_settings()
+    dest = Path(requested).expanduser().resolve() if requested else \
+        Path(settings["data_dir"]) if settings.get("data_dir") else ROOT.parent / "Strata-data"
+    sources = [ROOT, *other_installs(settings)]
+    if settings.get("data_dir"):
+        sources.append(Path(settings["data_dir"]))
+    sources += [f / "Strata-data" for f in list(sources)]
+    return dest, [f for f in dict.fromkeys(sources) if f != dest and has_data(f)]
+
+
+def install_mimo(a, fam: dict, gpu: dict, chosen: list, hip: bool, ram: float, data: Path, roots: list,
+                 port: int) -> int:
+    """Steps 2-7 of setup for MiMo-V2.6-Flash-RL (docs/MIMO.md); step 1 (the PC) is main()'s.  With a.dry_run it says
+    what it would do and changes nothing."""
+    dry, model = bool(getattr(a, "dry_run", False)), "MXFP4"
+    if a.model and a.model != model:
+        fail(f"{fam['title']} has no {a.model} model file", f"its one size is {model}: --family mimo (--model {model})")
+    why = mimo_problem(ram, gpu["vram_gb"], hip)
+    if why:
+        fail(why, "MiMo does not fit this PC; Qwen3.8-Flash-Next does (--family qwen, docs/AI_SETUP.md)")
+    if len(chosen) > 1:
+        warn(f"MiMo's engine runs on one GPU: GPU {gpu['index']} ({gpu['name']}) only")
+    for n in mimo_notes(gpu["vram_gb"], gpu["arch"]):
+        warn(n)
+    say(f"  {model}: {MODELS[model]['about']}; download {MODELS[model]['download_gb']:.0f} GB, keeps "
+        f"~{MODELS[model]['arena_gb']:.0f} GB of experts in RAM")
+    ok(f"size: {model}")
+    for flag, given in (("--vision", a.vision not in (None, "no", "none")), ("--kv", a.kv),
+                        ("--experimental-speed-projection",
+                         (a.experimental_speed_projection or "off").lower() not in ("off", "no", "n", "0")),
+                        ("--rope-scaling", a.rope_scaling), ("--rope-scale", a.rope_scale is not None),
+                        ("--draft-vocab", a.draft_vocab), ("--low-ram", a.low_ram != "auto"),
+                        ("--resident-budget-gib", a.resident_budget_gib is not None),
+                        ("--kv-streaming", a.kv_streaming != "auto"), ("--layer-split", a.layer_split),
+                        ("--vram-reserve-mib", a.vram_reserve_mib is not None)):
+        if given:
+            warn(f"{flag} does not apply to MiMo (its engine has no such setting): left out")
+    ctx = mimo_context(a.context, gpu["vram_gb"], a.yes)
+    ok(f"context: {ctx} tokens (8-bit KV cache)")
+    ok("images: off (MiMo reads text only)")
+    tag = fam["tag"] + model
+    models_dir = Path(a.models_dir) / tag
+    record = models_dir / "sha256-checked.json"
+    found = mimo_locate(models_dir, [r for r in roots if r != data], tag, a.gguf_dir)
+    say()
+    for name, (size, _sha) in MIMO_FILES.items():
+        p = found[name]
+        if p is None:
+            say(f"  {name} ({size / 1e9:.1f} GB): " + ("would be downloaded" if dry else "to download"))
+        elif p.parent == models_dir:
+            say(f"  {name}: already in {models_dir}")
+        else:
+            say(f"  {name}: found complete in {p.parent}")
+    part = lambda n: models_dir / (n + ".part")        # noqa: E731
+    to_fetch = sum(s - (part(n).stat().st_size if part(n).is_file() else 0)
+                   for n, (s, _) in MIMO_FILES.items() if found[n] is None) / 1e9
+    need = to_fetch + 1
+    free = free_gb_dry(models_dir) if dry else free_gb(models_dir)
+    if free < need:
+        msg = f"not enough free disk space in {models_dir}: need ~{need:.0f} GB, {free:.0f} GB free"
+        if not dry:
+            fail(msg, "use --models-dir on a bigger drive (or --gguf-dir with the files you already have)")
+        warn(msg)
+    elif to_fetch:
+        ok(f"disk: {to_fetch:.0f} GB to download, {free:.0f} GB free in {models_dir}")
+
+    # ---- 3. python packages
+    step(3, "Python packages")
+    if dry:
+        say("  would install requirements.txt into .venv (numpy, jinja2, regex, ... cmake, ninja)")
+    else:
+        pip_install(requirement_lines() if REQUIREMENTS.exists() else PY_PACKAGES,
+                    "numpy, jinja2, regex, pyyaml, tqdm, requests, cmake, ninja, pillow, psutil")
+
+    # ---- 4. the engine
+    step(4, "MiMo's engine (strata-mimo)")
+    llama = ROOT / "third_party" / "llama.cpp"
+    if dry and not (llama / "ggml" / "CMakeLists.txt").exists():
+        say(f"  would download llama.cpp {LLAMA_CPP_COMMIT[:7]} (ggml for the build, gguf-py for the tokenizer) into "
+            f"{llama}")
+    else:
+        llama = get_llama_cpp()
+        ok(f"llama.cpp {LLAMA_CPP_COMMIT[:7]} (ggml, gguf-py)")
+    eng = build_mimo_engine(gpu, a.yes, llama, dry)
+    try:
+        meta = json.loads((eng / "BUILD.json").read_text())
+    except (OSError, ValueError):
+        meta = {}
+    lib_dirs = meta.get("cuda_dirs")
+    if lib_dirs is None:                               # (--dry-run before the first build: the toolkit found now)
+        nvcc = find_nvcc()[0]
+        lib_dirs = [str(d) for d in (Path(nvcc).parent, Path(nvcc).parent / "x64", Path(nvcc).parent.parent / "lib64")
+                    if d.is_dir()] if nvcc else []
+
+    # ---- 5. the model files
+    step(5, f"the model files of {fam['title']}")
+    paths = {}
+    for name, (size, sha) in MIMO_FILES.items():
+        dst = models_dir / name
+        p = found[name]
+        if dry:
+            link = p is not None and p != dst and same_drive(p, nearest_dir(models_dir))
+            paths[name] = dst if p is None or link else p
+            gb = f"{size / 1e9:.1f} GB" if size >= 1e8 else f"{size / 1e6:.0f} MB"
+            say(f"  {name}: " + (f"would download {fam['hf']}{name} ({gb})" if p is None else
+                                 (f"would hard-link it into {models_dir}, then check" if link else
+                                  "would use it where it is (another drive: not copied) and check" if p != dst else
+                                  "would check") + f" its SHA-256 ({gb} read once)"))
+            continue
+        if p is not None and p != dst:
+            p = mimo_adopt(p, dst)
+        if p is None:
+            download(fam["hf"] + name, dst)
+            p = dst
+        if not mimo_verify(p, size, sha, record):
+            if p.parent == models_dir:                 # ours (or a link to a bad copy): deleted
+                p.unlink(missing_ok=True)
+                p.with_name(p.name + ".done").unlink(missing_ok=True)
+            warn(f"{p} is not the pinned file: not used, downloading it instead")
+            download(fam["hf"] + name, dst)
+            p = dst
+            if not mimo_verify(p, size, sha, record):
+                p.unlink(missing_ok=True)
+                p.with_name(p.name + ".done").unlink(missing_ok=True)
+                fail(f"{name} downloaded with the wrong SHA-256: deleted", "run setup again to download it again")
+        paths[name] = p
+    if not dry:
+        ok("model files present and checked (SHA-256)")
+    shard1, mtp = (paths[n] for n in (list(MIMO_FILES)[0], list(MIMO_FILES)[2]))
+
+    # ---- 6. the tokenizer
+    step(6, "preparing the model for Strata")
+    pack = find_in(roots, f"packs/{tag.lower()}") or data / "packs" / tag.lower()
+    tok_cmd = [sys.executable, str(ROOT / "tools" / "strata_tokenizer.py"), "--gguf", str(shard1), "--out", str(pack)]
+    if (pack / "tokenizer" / "vocab.json").exists() and (pack / "tokenizer" / "tokenizer.json").exists():
+        ok(f"tokenizer: {pack / 'tokenizer'}")
+    elif dry:
+        say("  would extract the tokenizer: " + " ".join(tok_cmd))
+    else:
+        run(tok_cmd, env=dict(os.environ, STRATA_GGUF_PY=str(llama / "gguf-py")))   # writes <pack>/tokenizer/
+        ok(f"tokenizer: {pack / 'tokenizer'}")
+    profile = ROOT / "data" / fam["profile"]
+    if not profile.is_file():
+        fail(f"MiMo's expert profile is missing: {profile}", "get a complete copy of Strata (git pull) and run it again")
+
+    # ---- 7. the start script
+    step(7, "writing the start script")
+    cfg = {"exe": str(eng / MIMO_EXE),
+           "args": ["--native", str(shard1), "--mtp", str(mtp), "--expert-profile", str(profile),
+                    "--max-context", str(ctx)],
+           "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"), "model_name": fam["name"],
+           "log": str(ROOT / f"strata-{tag.lower()}.log"), "lib_dirs": lib_dirs, "port": port, "family": "mimo",
+           "gpu": gpu["index"], "gpus_asked": True}
+    if a.host:
+        cfg["host"] = a.host
+    if a.api_key:
+        cfg["api_key"] = a.api_key
+    cfg_path = ROOT / f"strata-{tag.lower()}.json"
+    if dry:
+        say(f"  would write {cfg_path}:")
+        for line in json.dumps({**cfg, **({"api_key": "<set>"} if a.api_key else {})}, indent=1).splitlines():
+            say("    " + line)
+        say(f"  would write the start script run-{tag.lower()}{'.bat' if WIN else '.sh'}")
+        say()
+        say("Dry run: nothing was installed, downloaded or written.")
+        return 0
+    write_config(cfg_path, cfg)
+    script = write_run_script(tag, cfg_path, port)
+    ok(f"start script: {script.name}")
+    say()
+    say("All set.")
+    say(f"  API (OpenAI):     http://127.0.0.1:{port}/v1   (any API key; model name: anything)")
+    say(f"  API (Anthropic):  http://127.0.0.1:{port}/v1/messages")
+    if a.host and a.host not in ("127.0.0.1", "localhost"):
+        say(f"  Other devices:    the server window prints this PC's address (http://<IP>:{port}/)"
+            + ("" if a.api_key else " - no API key set: anyone on your network can use it"))
+    say(f"  Next time:        just run {'START-HERE.bat' if WIN else './setup.sh'} (or {script.name}) - it starts right away")
+    say("  The first start takes about 70 s (measured): the engine copies ~150 GB of experts into pinned RAM.")
+    if a.no_start:
+        return 0
+    return start(cfg_path, port)
+
+
 # ------------------------------------------------------------------------------------------------ the rope config
 def derived_factor(ctx: int, trained: int = 262144) -> float:
     """The automatic extension factor: the FINAL context over the trained one, at least 1.
@@ -2963,6 +3430,9 @@ def main() -> int:
     ap.add_argument("--prebuilt", default=os.environ.get("STRATA_PREBUILT_URL", PREBUILT_URL),
                     help="where the ready-made engine is (a URL folder or a local folder)")
     ap.add_argument("--check", action="store_true", help="only check this PC and exit")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="say what setup would do (files found, downloads, the build, the config) and change nothing; "
+                         "--family mimo only for now")
     ap.add_argument("--calibrate", action="store_true",
                     help="tune the engine's settings for this PC (about 5-10 minutes), then start the model")
     ap.add_argument("--draft-vocab", choices=list(DRAFT_VOCABS),
@@ -2999,8 +3469,11 @@ def main() -> int:
             a.gpu = int(a.gpu)
         else:
             ap.error(f"--gpu takes a GPU number as nvidia-smi numbers them, e.g. --gpu 1 (or --gpus 0,2), not {a.gpu!r}")
+    if a.dry_run and a.family != "mimo":
+        ap.error("--dry-run is for --family mimo only so far")
     say("Strata - Qwen3.8-Flash-Next on a normal PC (a GPU + system RAM + CPU)")
-    data, elsewhere = data_folder(a.data_dir)          # the model files: in the data folder, found from any copy
+    # the model files: in the data folder, found from any copy (--dry-run: found, nothing moved or saved)
+    data, elsewhere = data_folder_dry(a.data_dir) if a.dry_run else data_folder(a.data_dir)
     roots = [data, *elsewhere]
     if a.models_dir is None:
         a.models_dir = str(data / "models")
@@ -3009,8 +3482,8 @@ def main() -> int:
     have = installed_configs()
     if a.update:                                       # #475: UPDATE.bat / update.sh - never starts the model
         return update_install(have, a)
-    explicit = a.setup or a.model or a.family or a.check or a.no_start
-    if not have and not explicit:                      # a new copy of Strata (an update unzipped elsewhere): set it
+    explicit = a.setup or a.model or a.family or a.check or a.no_start or a.dry_run
+    if not have and not explicit:                     # a new copy of Strata (an update unzipped elsewhere): set it
         prev = previous_config(elsewhere, load_settings())   # up like the last one, from the files already here
         if prev is not None:
             ch = choices_from_config(prev)
@@ -3126,7 +3599,11 @@ def main() -> int:
                  + (f"; AMD ({', '.join(AMD_ARCHS)}): --backend hip" if amd else ""))
         if len(found) > 1 or gpu_problem(found[0]) is not None:
             gpu_table(found)
-        sel = choose_gpus(a, found)                    # asked when two or more cards can share the model
+        one = sorted([g for g in found if gpu_problem(g) is None], key=lambda x: (-round(x["vram_gb"]), x["index"]))
+        if a.family == "mimo" and not a.gpus and a.gpu is None and one:
+            sel = [one[0]["index"]]                    # MiMo's engine runs on one card: the one with the most VRAM
+        else:
+            sel = choose_gpus(a, found)                # asked when two or more cards can share the model
         multi = sel if len(sel) > 1 else []
         a.gpu = sel[0]                                 # the main GPU: the checks and the sizing below are its
         GPU_PICK = a.gpu
@@ -3171,6 +3648,13 @@ def main() -> int:
         say()
         for m, d in MODELS.items():
             verdict = "fits" if ram >= d["ram_gb"] else "tight" if ram >= d["ram_gb"] - 8 else "does not fit"
+            if "mimo" in d.get("families", ()):         # MiMo: RAM, VRAM and NVIDIA (install_mimo's checks)
+                why = mimo_problem(ram, gpu["vram_gb"], hip)
+                notes = [] if why else mimo_notes(gpu["vram_gb"], gpu.get("arch", "120") if not hip else "120")
+                verdict = (f"does not fit ({why})" if why else "fits (--family mimo; EXPERIMENTAL"
+                           + ("; " + "; ".join(n.split(":")[0] for n in notes) + ": untested" if notes else "") + ")")
+                say(f"  {m:8s} needs ~{d['ram_gb']} GB RAM, {MIMO_VRAM_MIN_GB}+ GB VRAM: {verdict}")
+                continue
             if d.get("budget"):
                 verdict = (f"EXPERIMENTAL, fits with {resident_budget_gib(m, ram)} GiB of its experts in RAM, the rest "
                            "read from the SSD" if ram >= d["ram_gb"] else "does not fit")
@@ -3198,6 +3682,8 @@ def main() -> int:
     ok(f"model: {fam['title']}")
     if fam.get("license"):
         say(f"  Its license: {fam['license']}")
+    if fam.get("engine") == "mimo":                    # another model with its own engine (docs/MIMO.md)
+        return install_mimo(a, fam, gpu, chosen, hip, ram, data, roots, port)
     say()
     names = [m for m in MODELS if family in MODELS[m].get("families", ("qwen", "swift"))]
     if a.model and a.model not in names:

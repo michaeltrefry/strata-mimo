@@ -45,6 +45,7 @@ build-vision.bat
 
 # setup.py outputs (engine, downloads) and release builds
 /engine/
+/engine-mimo/
 /build-release*/
 /dist/
 *.done

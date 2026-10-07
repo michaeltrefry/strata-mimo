@@ -62,6 +62,8 @@ FALLBACK_MODELS = {
     "UD-Q4_K_XL": {"about": "4-bit (Unsloth Dynamic), EXPERIMENTAL: the best quality, but most experts come from the "
                             "SSD on a 64 GB PC (7-8.5 tokens/s measured)", "download_gb": 111.3, "ram_gb": 48,
                    "arena_gb": 77.0, "families": ("unsloth",), "budget": True},
+    "MXFP4": {"about": "MiMo's only size: MXFP4 experts, a Q8_0 MTP layer", "download_gb": 169.8,
+              "ram_gb": 192, "arena_gb": 150.0, "families": ("mimo",)},
 }
 FALLBACK_FAMILIES = {
     "qwen": {"title": "Qwen3.8-Flash-Next", "about": "the original model", "tag": ""},
@@ -72,6 +74,9 @@ FALLBACK_FAMILIES = {
     "unsloth": {"title": "Qwen3.8-Flash-Next (Unsloth)", "about": "4-bit, 111 GB download, most experts read from the "
                                                                   "SSD: slow (7-8.5 tokens/s on a 64 GB PC)",
                 "tag": "unsloth-", "experimental": True, "vision": False},
+    "mimo": {"title": "MiMo-V2.6-Flash-RL", "about": "309B (15B active), for code: needs 192 GB of RAM and an NVIDIA "
+                                                     "card with 32 GB+ (measured on 96 GB)",
+             "tag": "mimo-", "experimental": True, "vision": False},
 }
 FALLBACK_CONTEXTS = [8192, 32768, 65536, 131072, 262144, 393216, 524288]
 BENCH_PROMPT = ("Write a short story (about 300 words) about a lighthouse keeper who finds a message in a bottle. "
@@ -1219,6 +1224,8 @@ class Tools:
             context = 32768 if vram < 14 else 65536 if vram < 20 else 131072
             if models[model].get("budget"):
                 context = 8192 if vram < 14 else 32768
+            if family == "mimo":                     # setup's own MiMo default (256K from 80 GB of VRAM)
+                context = 262144 if vram >= 80 else 65536
         if vision in ("yes", "gpu", "cpu") and families[family].get("vision") is False:
             raise ToolError(f"images are not available with {families[family]['title']} yet: use vision=no")
         if vision is not None and backend == "hip" and vision != "no":

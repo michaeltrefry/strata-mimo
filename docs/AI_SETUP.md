@@ -14,8 +14,8 @@ Work through the steps in order. Tell the user what you are doing in plain words
   user the key. Never put a tunnel or port forward in front of a server without a key.
 - Do not change the user's system beyond what setup does (setup installs Python for the user account if needed,
   and everything else inside the Strata folder and its `Strata-data` folder). Ask before installing drivers.
-- The model download is ~70 GB (up to 111 GB for Unsloth's 4-bit). Confirm the user is fine with that before you
-  start, especially on a metered connection.
+- The model download is ~70 GB (up to 111 GB for Unsloth's 4-bit, 170 GB for MiMo). Confirm the user is fine with
+  that before you start, especially on a metered connection.
 - Setup is long-running (an hour or more on a slow connection). Run it in the background or with a long timeout and
   poll its output; do not kill it because it is quiet for a while. It is resumable: running the same command again
   continues where it stopped.
@@ -77,6 +77,13 @@ By the PC's RAM (ask the user whether they mainly want it for code - then the Co
 `--family swift` (Swift 1.5, a fine-tune that thinks shorter; sizes Q2_0, IQ2_XS, IQ3_XXS) is the alternative to
 `qwen`. With `--yes` and no `--model`, setup picks the recommended size for the RAM itself. More: [MODELS.md](MODELS.md).
 
+**MiMo-V2.6-Flash-RL** (`--family mimo`, experimental, for code; details: [MIMO.md](MIMO.md)) is a much bigger model
+(309B, 15B active) with its own engine, which setup compiles. It needs **192 GB of RAM or more** and **one NVIDIA card
+with 32 GB of VRAM or more**; setup refuses less, and AMD cards. Every MiMo number was measured on a 96 GB RTX PRO 6000
+(117-125 tokens/s on short coding prompts); on a smaller card setup warns that the speed is unmeasured. Its download
+is 170 GB, and setup uses a complete copy already in Hugging Face's cache (`HF_HOME`) instead of downloading it. Only
+offer it when the PC has that RAM and card and the user wants it.
+
 ## 4. Run setup without questions
 
 From the Strata folder (Windows: in `cmd`, or `cmd /c START-HERE.bat ...` from PowerShell):
@@ -91,8 +98,8 @@ The flags (all of them: `START-HERE.bat --help`):
 | Flag | Meaning |
 | --- | --- |
 | `--yes` | take the recommended answer to every question (no prompts) |
-| `--family qwen\|swift\|coder\|unsloth` | the model version |
-| `--model Q2_0\|IQ2_XS\|IQ3_XXS\|IQ3_S\|IQ1_M\|UD-Q4_K_XL` | the size (the Coder is IQ1_M, Unsloth UD-Q4_K_XL) |
+| `--family qwen\|swift\|coder\|unsloth\|mimo` | the model version |
+| `--model Q2_0\|IQ2_XS\|IQ3_XXS\|IQ3_S\|IQ1_M\|UD-Q4_K_XL\|MXFP4` | the size (the Coder is IQ1_M, Unsloth UD-Q4_K_XL, MiMo MXFP4) |
 | `--context N` | context in tokens; default by VRAM: 32768 under 14 GB, 65536 under 20 GB, else 131072 |
 | `--vision yes\|no\|gpu\|cpu` | read pictures; `--yes` leaves images off. AMD cards: `cpu` |
 | `--gpu N` / `--gpus 0,1` / `--gpus all` | one card, or several sharing the model (default: the card with the most VRAM) |
@@ -103,6 +110,11 @@ The flags (all of them: `START-HERE.bat --help`):
 | `--no-start` | install only, do not start the server |
 | `--setup` | install another model or change settings of an installed one |
 | `--check` | only check the PC |
+| `--dry-run` | MiMo only for now: say what setup would do (files found, downloads, the build, the config) and change nothing |
+
+For MiMo: `START-HERE.bat --yes --family mimo --no-start` (run it with `--dry-run` first to see which files it found
+and what it would build and write). Its context is 256K on a card with 80 GB or more, else 64K (`--context` up to
+262144); the image, KV and draft options do not apply to it.
 
 `--no-start` is recommended for agents: the server runs in the foreground until its window is closed, which would
 block your shell. Start it separately in step 6.
@@ -132,7 +144,7 @@ Notes:
 ## 6. Start the server
 
 Setup prints the start script it wrote (`start script: run-<model>.bat`). The name is the family tag plus the size,
-lower case: `run-iq2_xs`, `run-swift-iq2_xs`, `run-coder-iq1_m`, `run-unsloth-ud-q4_k_xl`.
+lower case: `run-iq2_xs`, `run-swift-iq2_xs`, `run-coder-iq1_m`, `run-unsloth-ud-q4_k_xl`, `run-mimo-mxfp4`.
 
 ```
 Windows (PowerShell):  Start-Process -FilePath ".\run-iq2_xs.bat"            (opens its own window)
@@ -145,7 +157,8 @@ ready. Closing its window (or stopping the process) stops the model.
 
 ## 7. Verify
 
-The HTTP server answers once the model is loaded (30-90 s on later starts, a few minutes the first time). Poll:
+The HTTP server answers once the model is loaded (30-90 s on later starts, a few minutes the first time; MiMo about
+70 s, measured, while it copies ~150 GB of experts into pinned RAM). Poll:
 
 ```
 curl http://127.0.0.1:8080/health

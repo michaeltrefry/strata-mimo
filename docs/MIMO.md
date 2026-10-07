@@ -20,39 +20,73 @@ and 512 GB of DDR5-6400, Windows 11.
 Quality: against llama.cpp on the same tokens the final logits agree on the top token at 98.4% of positions (KL mean
 0.0026) and the perplexity is the same within noise (1.7942 vs 1.7896); see [MIMO_DECODER.md](MIMO_DECODER.md).
 
-## Running it
+## Installing it
+
+Setup does everything below by itself (Windows: `cmd`; Linux: `./setup.sh` with the same flags):
+
+```
+START-HERE.bat --setup --yes --family mimo --no-start      (what it would do, changing nothing: add --dry-run)
+run-mimo-mxfp4.bat                                          (starts the server on http://127.0.0.1:8080)
+```
+
+What it needs and checks first: an NVIDIA card with 32 GB of VRAM or more (one card; AMD is refused: the MXFP4 kernels
+are CUDA), 192 GB of RAM or more (the engine keeps a pinned ~150 GB copy of the experts), ~170 GB of free disk for
+the files it has to download.  Every number on this page is from the 96 GB card; with less VRAM setup warns that the
+speed is unmeasured, and on a card other than sm_120 that it is untested.  The context is 256K on a card with 80 GB or
+more and 64K below (`--context N` up to 262144).
+
+What it does, each step skipped when it is already done:
+
+1. checks the PC (as for Qwen) and the MiMo limits above; with several cards it takes the one with the most VRAM
+   (`--gpu N` for another);
+2. installs the Python packages and compiles `strata-mimo` for the card into `engine-mimo/` (build folder
+   `build-mimo/`, CUDA 12.8 or newer: 42 s from an empty build folder on this PC, longer on a smaller CPU; compiled again
+   after a `git pull` changes the engine's source);
+3. gets the three files of `ggml-org/MiMo-V2.6-Flash-RL-GGUF` at revision `a5d1269f` (the two MXFP4 shards and
+   `mtp-MiMo-V2.6-Flash-RL-Q8_0.gguf`, 169.8 GB).  A complete copy already on the PC is used instead of a download:
+   in the model folder, in another Strata data folder, in `--gguf-dir`, or in Hugging Face's download cache
+   (`HF_HUB_CACHE`, `HF_HOME/hub` or `~/.cache/huggingface/hub`, the pinned revision only).  On the same drive it is
+   hard-linked into the model folder, on another drive it is used where it is (never copied).  Every file's size and
+   SHA-256 are checked against the pinned values once (the 167 GB shard takes a few minutes);
+4. extracts the tokenizer from shard 1 (`tools/strata_tokenizer.py`: `pre` = `qwen2`);
+5. writes `strata-mimo-mxfp4.json` (below) and `run-mimo-mxfp4.bat` / `.sh`.
+
+`START-HERE.bat` with no flags then starts it like a Qwen install (it asks which one when several are installed);
+`UPDATE.bat` recompiles `strata-mimo` when its source changed.  The first start takes about 70 s (the pinned RAM copy
+of the experts); the engine needs ~150 GB of free RAM and the whole GPU.
+
+## By hand
 
 Build (Windows, CUDA 12.9, VS 2022 Build Tools; the pinned ggml is fetched on the first configure):
 
 ```
-cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 ^
-      -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared
+cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120
 cmake --build build --target strata-mimo
 ```
 
-The model: `ggml-org/MiMo-V2.6-Flash-RL-GGUF`, the MXFP4 files (167 GB) and `mtp-MiMo-V2.6-Flash-RL-Q8_0.gguf`
-(2.4 GB).  The tokenizer for the server: `python tools/strata_tokenizer.py --gguf <shard 1> --out <dir>`.  The
-expert profile: `python tools/mimo/make_profile.py <out.prof> <moe-trace file>` (the one used here came from
-the model's own answers to 44 coding prompts).
-
-A server config (JSON, as `serve/server.py --config` reads it):
+(Setup's configure, with `-DSTRATA_BUILD_TESTS=OFF`, links without `-DCMAKE_CUDA_RUNTIME_LIBRARY=Shared`; a build with
+the tests on needed it on this PC.)  The tokenizer: `python tools/strata_tokenizer.py --gguf <shard 1> --out <dir>`.
+The expert profile: `data/mimo-coding-answers.prof`, made with `python tools/mimo/make_profile.py <out.prof>
+<moe-trace file>` from the model's own answers to 44 coding prompts.  The config setup writes (`serve/server.py
+--config` reads it; the server adds `--serve`):
 
 ```json
 {
-  "exe": "D:/repos/Strata-MiMo/build/strata-mimo.exe",
-  "args": ["--native", "<...>/MiMo-V2.6-Flash-RL-MXFP4-00001-of-00002.gguf",
-           "--mtp", "<...>/mtp-MiMo-V2.6-Flash-RL-Q8_0.gguf",
-           "--expert-profile", "<...>/coding-answers.prof",
-           "--max-context", "262144"],
-  "cwd": "D:/repos/Strata-MiMo",
-  "tokenizer": "<dir>/tokenizer",
-  "model_name": "mimo-v2.6-flash-rl",
-  "env": {"CUDA_VISIBLE_DEVICES": "0"}
+ "exe": "<Strata>/engine-mimo/strata-mimo.exe",
+ "args": ["--native", "<...>/MiMo-V2.6-Flash-RL-MXFP4-00001-of-00002.gguf",
+          "--mtp", "<...>/mtp-MiMo-V2.6-Flash-RL-Q8_0.gguf",
+          "--expert-profile", "<Strata>/data/mimo-coding-answers.prof",
+          "--max-context", "262144"],
+ "cwd": "<Strata>",
+ "tokenizer": "<Strata-data>/packs/mimo-mxfp4/tokenizer",
+ "model_name": "mimo-v2.6-flash-rl",
+ "log": "<Strata>/strata-mimo-mxfp4.log",
+ "lib_dirs": ["<the CUDA toolkit's bin>"],
+ "port": 8080, "family": "mimo", "gpu": 0, "gpus_asked": true
 }
 ```
 
-then `python serve/server.py --engine strata --config <that file> --host 127.0.0.1 --port 8096`.  Start-up takes
-about 70 s (the 150 GB pinned RAM copy of the experts).  The engine needs ~150 GB of free RAM and the whole GPU.
+then `python serve/server.py --engine strata --config <that file> --host 127.0.0.1 --port 8080`.
 
 ## Where things are
 
@@ -68,7 +102,9 @@ about 70 s (the 150 GB pinned RAM copy of the experts).  The engine needs ~150 G
 ## Not done yet
 
 - Residency that adapts DURING generation (today it follows the profile, and a long prompt's own routing).
-- setup.py: downloading MiMo and writing the config; the start-up time.
+- The start-up time (~70 s, the pinned copy of the experts).
+- Setup's MiMo path was run here as far as `--dry-run`, the strata-mimo build and the tokenizer extraction (the
+  tokenizer files equal the hand-made ones); a full install on a fresh PC is not yet done.
 - When the server is killed hard, the engine process can outlive it (seen on this machine; Strata's job object is
   meant to prevent that).
 - llama.cpp's large-batch MXFP4 MoE path is 11-31% off the exact result on this machine (MIMO_DECODER.md): not
