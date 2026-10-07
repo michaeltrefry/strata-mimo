@@ -425,7 +425,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
 
   # ---- MiMo-V2.6-Flash (docs/MIMO_PORT_PLAN.md) -------------------------------------------------------------
-  add_library(strata_mimo STATIC src/mimo/model.cpp src/mimo/router.cu)
+  add_library(strata_mimo STATIC src/mimo/model.cpp src/mimo/router.cu src/mimo/ops.cu)
   if(STRATA_ENABLE_CUDA)
     # step 3: the resident experts' MXFP4 kernels (CUDA only for now: inline PTX loads)
     target_sources(strata_mimo PRIVATE src/mimo/kernels/expert_mxfp4.cu)
