@@ -810,6 +810,9 @@ def profile_shape(path: str) -> tuple[int, int] | None:
             size = os.fstat(f.fileno()).st_size
     except OSError:
         return None
+    if len(head) >= 24 and head[:8] == b"MIMOPROF":   # MiMo's (tools/mimo/make_profile.py): f32 scores [nl][ne]
+        _, nl, ne = struct.unpack("<3I", head[8:20])
+        return (nl, ne) if size >= 28 + 4 * nl * ne else None
     if len(head) < 24 or head[:4] != b"STRP":
         return None
     _, nl, ne, _, n = struct.unpack("<5I", head[4:])

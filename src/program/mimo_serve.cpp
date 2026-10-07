@@ -116,6 +116,8 @@ int main(int argc, char** argv) {
     std::string model_path;
     std::set<int32_t> eos = {151645, 151643};   // <|im_end|>, <|endoftext|>
     bool serve = false;
+    std::string save_path;          // the learned profile (Strata's #477 protocol): on QUIT and every N minutes
+    double save_every_min = 10;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto val = [&](std::string& out) {
@@ -129,6 +131,8 @@ int main(int argc, char** argv) {
         else if (a == "--max-context") { val(v); cfg.max_ctx = std::atoi(v.c_str()); }
         else if (a == "--budget-gib") { val(v); cfg.expert_budget_gib = std::atof(v.c_str()); }
         else if (a == "--batched-min") { val(v); cfg.batched_min_prompt = std::atoi(v.c_str()); }
+        else if (a == "--expert-profile-save") val(save_path);
+        else if (a == "--expert-profile-save-every") { val(v); save_every_min = std::atof(v.c_str()); }
         else if (a == "--eos-ids") {
             val(v);
             eos.clear();
@@ -168,8 +172,18 @@ int main(int argc, char** argv) {
         std::vector<int32_t> session;   // tokens whose KV is valid, in position order
         Sampler sampler;
         std::string line;
+        auto last_save = clk::now();
+        auto save_learned = [&](bool force) {
+            if (save_path.empty()) return;
+            const double mins = std::chrono::duration<double>(clk::now() - last_save).count() / 60.0;
+            if (!force && (save_every_min <= 0 || mins < save_every_min)) return;
+            std::string e;
+            if (!dec.save_profile(save_path, e)) std::fprintf(stderr, "strata-mimo: %s\n", e.c_str());
+            last_save = clk::now();
+        };
         while (input.next(line)) {
             if (line == "QUIT") break;
+            save_learned(false);
             if (line.rfind("GEN ", 0) != 0) {
                 if (!line.empty()) say("ERR unknown command");
                 continue;
@@ -292,6 +306,7 @@ int main(int argc, char** argv) {
                           (unsigned long long) st.expert_hits, (unsigned long long) st.expert_uses, n - start);
             say(done);
         }
+        save_learned(true);
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "strata-mimo: %s\n", e.what());

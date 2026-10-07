@@ -19,6 +19,7 @@
 #include <immintrin.h>
 #include <chrono>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -41,7 +42,8 @@ void q8_0_gemv(const DevTensor& w, const float* x, void* q8, float* y, int T, cu
 }
 
 // MIMOPROF v1 (tools/mimo/make_profile.py): score[layer][expert]
-bool read_profile(const std::string& path, int n_layer, int n_expert, std::vector<float>& score, std::string& err) {
+bool read_profile(const std::string& path, int n_layer, int n_expert, std::vector<float>& score, std::string& err,
+                  uint64_t* tokens_out = nullptr) {
     std::ifstream f(path, std::ios::binary);
     char magic[8];
     uint32_t hdr[3];
@@ -55,6 +57,7 @@ bool read_profile(const std::string& path, int n_layer, int n_expert, std::vecto
         err = "profile " + path + " is for " + std::to_string(hdr[1]) + " layers x " + std::to_string(hdr[2]) + " experts";
         return false;
     }
+    if (tokens_out) *tokens_out = tokens;
     score.resize((size_t) n_layer * n_expert);
     if (!f.read((char*) score.data(), (std::streamsize) (score.size() * 4))) {
         err = "profile " + path + " is truncated";
@@ -198,7 +201,7 @@ bool MimoDecoder::init(std::string& err) {
     std::vector<std::pair<int, int>> pick;   // (layer, expert), most used first
     if (want > 0) {
         std::vector<float> score;
-        if (!read_profile(cfg_.profile, g.n_layer, g.n_expert, score, err)) return false;
+        if (!read_profile(cfg_.profile, g.n_layer, g.n_expert, score, err, &profile_tokens_)) return false;
         profile_score_ = score;
         std::vector<int> order(score.size());
         std::iota(order.begin(), order.end(), 0);
@@ -459,6 +462,38 @@ bool MimoDecoder::prompt(const int32_t* tokens, int n, int pos0, const ChooseFn&
     return true;
 }
 
+bool MimoDecoder::save_profile(const std::string& path, std::string& err) const {
+    const MimoGeometry& g = model_.geometry();
+    const int ne = g.n_expert;
+    const double wb = profile_score_.empty() ? 0.0 : (double) std::max<uint64_t>(profile_tokens_, 1);
+    const double wo = (double) usage_tokens_;
+    std::vector<float> out((size_t) g.n_layer * ne, 0.f);
+    for (int l = 0; l < g.n_layer; ++l) {
+        double tot = 0;
+        for (int e = 0; e < ne; ++e) tot += usage_.empty() ? 0.0 : usage_[(size_t) l * ne + e];
+        for (int e = 0; e < ne; ++e) {
+            const double b = profile_score_.empty() ? 0.0 : profile_score_[(size_t) l * ne + e];
+            const double o = tot > 0 ? usage_[(size_t) l * ne + e] / tot : 0.0;
+            out[(size_t) l * ne + e] = (wb + (tot > 0 ? wo : 0.0)) > 0 ? (float) ((wb * b + (tot > 0 ? wo : 0.0) * o) /
+                                                                                 (wb + (tot > 0 ? wo : 0.0))) : 0.f;
+        }
+    }
+    const std::string tmp = path + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::binary);
+        const uint32_t hdr[3] = {1, (uint32_t) g.n_layer, (uint32_t) ne};
+        const uint64_t tokens = (uint64_t) (wb + wo);
+        f.write("MIMOPROF", 8);
+        f.write((const char*) hdr, 12);
+        f.write((const char*) &tokens, 8);
+        f.write((const char*) out.data(), (std::streamsize) (out.size() * 4));
+        if (!f) { err = "cannot write " + tmp; return false; }
+    }
+    std::remove(path.c_str());   // replaced whole: a crash mid-write leaves the old file
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) { err = "cannot rename " + tmp + " to " + path; return false; }
+    return true;
+}
+
 void MimoDecoder::adapt_count(int l, const int32_t* ids, int n) {
     if (recent_.empty()) return;
     const int ne = model_.geometry().n_expert;
@@ -673,10 +708,13 @@ bool MimoDecoder::forward_graph(int T, int pos0, int32_t* next, std::string& err
             stats_.expert_hits += hit;
             ids[i] = hit ? -1 : e;
         }
-        if (!recent_.empty()) {   // the window's picks of this layer, for decode-time residency
+        {   // the window's picks of this layer: decode-time residency and the learned profile
             int32_t picks[kMaxT * kRouterMaxUsed];
             for (int i = 0; i < T * K; ++i) picks[i] = ((volatile int32_t*) h_ids_)[i];
             adapt_count(l, picks, T * K);
+            if (usage_.empty()) usage_.assign((size_t) g.n_layer * g.n_expert, 0.0);
+            for (int i = 0; i < T * K; ++i)
+                if (picks[i] >= 0 && picks[i] < g.n_expert) usage_[(size_t) l * g.n_expert + picks[i]] += 1.0;
         }
         const auto c0 = std::chrono::steady_clock::now();
         static const bool skip_cpu = std::getenv("MIMO_SKIP_CPU") != nullptr;   // timing diagnostic: wrong output
@@ -694,6 +732,7 @@ bool MimoDecoder::forward_graph(int T, int pos0, int32_t* next, std::string& err
     }
     cudaMemcpyAsync(next, next_, sizeof(int32_t) * T, cudaMemcpyDeviceToHost, s);
     if (!cuda_ok(cudaStreamSynchronize(s), "window", err)) return false;
+    usage_tokens_ += (uint64_t) T;
     if (!recent_.empty() && !adapt_window(T, err)) return false;
     if (cfg_.profile_gpu) {
         std::vector<unsigned long long> st((size_t) g.n_layer * 5);

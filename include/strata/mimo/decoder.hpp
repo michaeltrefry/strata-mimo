@@ -104,6 +104,9 @@ public:
     size_t vram_free_after_init() const { return vram_free_after_init_; }
 
     const DecoderStats& stats() const { return stats_; }
+    /// The profile blended with every pick counted since start (each side weighted by the tokens behind it), as a
+    /// MIMOPROF file: what this session's usage taught, for the next start's --expert-profile.
+    bool save_profile(const std::string& path, std::string& err) const;
     /// With profile_gpu: per MoE layer, the averages since init of (layer start -> doorbell, doorbell -> resident
     /// experts done, -> CPU flag seen, -> layer end) in microseconds, printed as one table.
     void print_profile() const;
@@ -163,6 +166,9 @@ private:
     size_t vram_free_after_init_ = 0;
     std::vector<std::vector<int>> resident_;   // [layer][expert] -> slot, -1 = not resident
     std::vector<float> profile_score_;         // [layer][expert] the profile's share of its layer's picks
+    uint64_t profile_tokens_ = 0;              // the tokens behind it (its header)
+    std::vector<double> usage_;                // [layer][expert] every pick counted since start
+    uint64_t usage_tokens_ = 0;
     std::vector<float> recent_;                // [layer][expert] decayed recent picks (in units of 1 / recent_scale_)
     float recent_scale_ = 1.f;
     std::vector<int> spares_;                  // slots holding no resident expert (copy targets)

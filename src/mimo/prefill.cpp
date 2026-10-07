@@ -236,7 +236,7 @@ bool MimoDecoder::prompt_batched(const int32_t* tokens, int n, int pos0, const C
     std::vector<int32_t> res(g.n_expert);
     // the prompt's routing, for adapt_residency: picks per layer and expert
     const bool adapt = n >= cfg_.adapt_min_prompt && !profile_score_.empty();
-    std::vector<std::vector<uint32_t>> counts(adapt ? (size_t) g.n_layer : 0, std::vector<uint32_t>((size_t) g.n_expert));
+    std::vector<std::vector<uint32_t>> counts((size_t) g.n_layer, std::vector<uint32_t>((size_t) g.n_expert));
     std::vector<int32_t> picks;
     std::vector<float> last_logits(V);
     for (int done = 0; done < n;) {
@@ -278,7 +278,7 @@ bool MimoDecoder::prompt_batched(const int32_t* tokens, int n, int pos0, const C
                 ml.slot_addr = slot_addr_.data();
                 ml.ram = cpu_ ? cpu_->source(l) : model_.experts(l);
                 pmoe_->run_layer(ml, s);
-                if (adapt) {
+                {   // the slice's picks: prompt-driven residency and the learned profile
                     picks.resize((size_t) S * K);
                     cudaMemcpyAsync(picks.data(), pIds_, sizeof(int32_t) * picks.size(), cudaMemcpyDeviceToHost, s);
                     cudaStreamSynchronize(s);
@@ -344,6 +344,10 @@ bool MimoDecoder::prompt_batched(const int32_t* tokens, int n, int pos0, const C
         if (!ok(cudaStreamSynchronize(s), "prompt slice", err)) return false;
         done += S;
     }
+    if (usage_.empty()) usage_.assign((size_t) g.n_layer * g.n_expert, 0.0);
+    for (int l = 0; l < g.n_layer; ++l)
+        for (int e = 0; e < g.n_expert; ++e) usage_[(size_t) l * g.n_expert + e] += counts[(size_t) l][(size_t) e];
+    usage_tokens_ += (uint64_t) n;
     if (borrow_lo_ >= 0 && !refill_slots(adapt ? &counts : nullptr, err)) return false;
     return adapt ? adapt_residency(counts, err) : true;
 }
