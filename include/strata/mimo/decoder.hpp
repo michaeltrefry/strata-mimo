@@ -35,12 +35,14 @@ struct DecoderConfig {
     bool cpu_experts = true;        // non-resident experts on the CPU (v1); false: copied into GPU staging slots (v0)
     bool ram_copy = true;           // CPU experts read from a RAM copy of every MoE layer (else the GGUF mapping)
     bool graph = true;              // v2: one CUDA graph per window size, the CPU handoff inside it (no dump)
+    bool profile_gpu = false;       // v2: GPU timestamps per layer (print_profile)
 };
 
 struct DecoderStats {
     uint64_t expert_uses = 0, expert_hits = 0;   // routed (token, expert) pairs, and those served from a resident slot
     uint64_t staged = 0;                         // experts copied into a staging slot (distinct per window and layer)
     double cpu_ms = 0;                           // time spent in CpuExperts::run_layer
+    double wait_ms = 0;                          // v2: host waiting for the GPU to reach the next MoE layer
 };
 
 class MimoDecoder {
@@ -59,6 +61,10 @@ public:
     bool forward(const int32_t* tokens, int T, int pos0, int32_t* next, std::vector<float>* logits, std::string& err);
 
     const DecoderStats& stats() const { return stats_; }
+    /// With profile_gpu: per MoE layer, the averages since init of (layer start -> doorbell, doorbell -> resident
+    /// experts done, -> CPU flag seen, -> layer end) in microseconds, printed as one table.
+    void print_profile() const;
+    void reset_profile() { prof_us_.assign(prof_us_.size(), 0.0); prof_windows_ = 0; }
     int resident_experts() const { return n_resident_; }
 
 private:
@@ -101,6 +107,9 @@ private:
     float *h_x_ = nullptr, *m_x_ = nullptr, *h_w_ = nullptr, *m_w_ = nullptr, *h_out_ = nullptr, *m_out_ = nullptr;
     int32_t *h_ids_ = nullptr, *m_ids_ = nullptr;
     uint32_t *h_seq_ = nullptr, *m_seq_ = nullptr, *h_flag_ = nullptr, *m_flag_ = nullptr;
+    unsigned long long* stamps_ = nullptr;     // device [48 * 5] GPU %globaltimer stamps of the last window
+    std::vector<double> prof_us_;              // accumulated [48 * 4] intervals
+    int prof_windows_ = 0;
 };
 
 }  // namespace strata::mimo

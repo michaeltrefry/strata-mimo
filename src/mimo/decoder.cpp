@@ -121,9 +121,18 @@ bool MimoDecoder::init(std::string& err) {
 
     // v1: the CPU computes the non-resident experts, from a RAM copy of every MoE layer
     if (cfg_.cpu_experts) {
-        pool_ = std::make_unique<cpu::ExpertPool>(0, true, true);   // one worker per physical core but the first
-        const cpu::CpuTopology topo = cpu::detect_cpu_topology(true);
-        if (topo.host_core >= 0) prev_affinity_ = cpu::pin_current_thread(topo.host_core);   // the host works in the pool
+        // MIMO_HOST_CORE=last: the host loop on the last physical core and one worker fewer, away from core 0
+        // (where Windows services interrupts); default: Strata's layout, the host on the first physical core
+        const char* hc = std::getenv("MIMO_HOST_CORE");
+        const std::vector<int> cores = cpu::physical_cores(false);
+        if (hc && std::string(hc) == "last" && cores.size() > 2) {
+            pool_ = std::make_unique<cpu::ExpertPool>((int) cores.size() - 2, true, true);   // workers on cores 1..n-2
+            prev_affinity_ = cpu::pin_current_thread(cores.back());
+        } else {
+            pool_ = std::make_unique<cpu::ExpertPool>(0, true, true);   // one worker per physical core but the first
+            const cpu::CpuTopology topo = cpu::detect_cpu_topology(true);
+            if (topo.host_core >= 0) prev_affinity_ = cpu::pin_current_thread(topo.host_core);   // the host works too
+        }
         cpu_ = std::make_unique<CpuExperts>(model_, *pool_);
         if (cfg_.ram_copy)
             for (int l = 0; l < g.n_layer; ++l) {
@@ -204,6 +213,7 @@ bool MimoDecoder::init(std::string& err) {
     }
     // the residency table on the device (v2 builds each layer's slot list there)
     if (!dev(sizeof(int32_t) * (size_t) g.n_layer * g.n_expert, &d_res_)) return false;
+    if (cfg_.profile_gpu && !dev(sizeof(unsigned long long) * (size_t) g.n_layer * 5, &stamps_)) return false;
     std::vector<int32_t> flat;
     for (const auto& r : resident_) flat.insert(flat.end(), r.begin(), r.end());
     return cuda_ok(cudaMemcpy(d_res_, flat.data(), sizeof(int32_t) * flat.size(), cudaMemcpyHostToDevice), "residency", err);
@@ -228,9 +238,13 @@ bool MimoDecoder::capture(int T, std::string& err) {
     if (!cuda_ok(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal), "capture", err)) return false;
     embed_q8_0(model_.token_embd().data, tok_, x_, T, E, s);
     uint32_t ring = 0;
+    auto stamp = [&](int l, int i) {
+        if (cfg_.profile_gpu) strata::kernels::gpu_stamp(stamps_, l * 5 + i, s);
+    };
     for (int l = 0; l < g.n_layer; ++l) {
         const LayerWeights& w = model_.layer(l);
         const AttnLayer& L = attn_[(size_t) l];
+        stamp(l, 0);
         mimo_rmsnorm(x_, (const float*) w.attn_norm.data, h_, E, T, g.rms_eps, s);
         q8_0_gemv(w.attn_qkv, h_, q8_, qkv_, T, s);
         mimo_qkv_rope_append(qkv_, pos0_, T, L, kv_[(size_t) l], q_, s);
@@ -250,13 +264,17 @@ bool MimoDecoder::capture(int T, std::string& err) {
             resident_slots(ids_, d_res_ + (size_t) l * g.n_expert, slots_, T * K, s);
             strata::kernels::doorbell_publish(h_, ids_, wt_, (int64_t) T * E, (int64_t) T * K, m_x_, m_ids_, m_w_,
                                               m_seq_, s);
+            stamp(l, 1);
             fill_zero(y_, T * E, s);
             mxfp4_experts(slot_ptr_, slots_, wt_, h_, y_, T, K, mx_scratch_, s);
+            stamp(l, 2);
             strata::kernels::wait_flag_ge(m_flag_, ++ring, s);
+            stamp(l, 3);
             strata::kernels::copy_from_mapped(cpu_out_, m_out_, (int64_t) T * E, s);
             add_scaled(y_, cpu_out_, 1.f, E * T, s);
         }
         add_scaled(x_, y_, 1.f, E * T, s);
+        stamp(l, 4);
     }
     mimo_rmsnorm(x_, (const float*) model_.output_norm().data, h_, E, T, g.rms_eps, s);
     q8_0_gemv(model_.output(), h_, q8_, logits_, T, s);
@@ -285,10 +303,16 @@ bool MimoDecoder::forward_graph(int T, int pos0, int32_t* next, std::string& err
         if (!g.is_moe(l)) continue;
         const uint32_t want = ++ring;
         const auto a = std::chrono::steady_clock::now();
+        auto last_query = a;
         uint32_t spins = 0;
         while (*seq < want) {
             _mm_pause();
-            if ((++spins & 4095u) != 0) continue;
+            if ((++spins & 1023u) != 0) continue;
+            // a driver call costs tens of microseconds, during which the doorbell goes unseen: ask whether the
+            // graph died only every 2 ms (Strata's Verifier does the same)
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_query < std::chrono::milliseconds(2)) continue;
+            last_query = now;
             const cudaError_t q = cudaStreamQuery(s);
             if (q != cudaErrorNotReady && *seq < want) {
                 release_gpu_waits();
@@ -304,6 +328,7 @@ bool MimoDecoder::forward_graph(int T, int pos0, int32_t* next, std::string& err
             }
         }
         std::atomic_thread_fence(std::memory_order_acquire);
+        stats_.wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
         for (int i = 0; i < T * K; ++i) {
             const int e = ((volatile int32_t*) h_ids_)[i];
             ++stats_.expert_uses;
@@ -312,14 +337,53 @@ bool MimoDecoder::forward_graph(int T, int pos0, int32_t* next, std::string& err
             ids[i] = hit ? -1 : e;
         }
         const auto c0 = std::chrono::steady_clock::now();
-        cpu_->run_layer(l, T, h_x_, K, ids, h_w_, h_out_);
+        static const bool skip_cpu = std::getenv("MIMO_SKIP_CPU") != nullptr;   // timing diagnostic: wrong output
+        static const double fake_us = std::getenv("MIMO_FAKE_CPU_US") ? std::atof(std::getenv("MIMO_FAKE_CPU_US")) : 0;
+        if (skip_cpu) {
+            std::memset(h_out_, 0, sizeof(float) * T * g.n_embd);
+            while (std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - c0).count() < fake_us)
+                _mm_pause();
+        }
+        else cpu_->run_layer(l, T, h_x_, K, ids, h_w_, h_out_);
         stats_.cpu_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();
         *flag = want;
     }
     cudaMemcpyAsync(next, next_, sizeof(int32_t) * T, cudaMemcpyDeviceToHost, s);
-    return cuda_ok(cudaStreamSynchronize(s), "window", err);
+    if (!cuda_ok(cudaStreamSynchronize(s), "window", err)) return false;
+    if (cfg_.profile_gpu) {
+        std::vector<unsigned long long> st((size_t) g.n_layer * 5);
+        cudaMemcpy(st.data(), stamps_, st.size() * 8, cudaMemcpyDeviceToHost);
+        prof_us_.resize((size_t) g.n_layer * 4, 0.0);
+        for (int l = 0; l < g.n_layer; ++l) {
+            if (!g.is_moe(l)) continue;
+            const unsigned long long* p = &st[(size_t) l * 5];
+            for (int i = 0; i < 4; ++i) prof_us_[(size_t) l * 4 + i] += (double) (p[i + 1] - p[i]) / 1000.0;
+        }
+        ++prof_windows_;
+    }
+    return true;
+}
+
+void MimoDecoder::print_profile() const {
+    if (!prof_windows_) return;
+    const MimoGeometry& g = model_.geometry();
+    double sum[4] = {0, 0, 0, 0};
+    int n = 0;
+    std::printf("GPU per MoE layer, us (avg of %d windows): attention+router | resident experts | wait for CPU | combine\n",
+                prof_windows_);
+    for (int l = 0; l < g.n_layer; ++l) {
+        if (!g.is_moe(l)) continue;
+        ++n;
+        for (int i = 0; i < 4; ++i) sum[i] += prof_us_[(size_t) l * 4 + i] / prof_windows_;
+        if (l == 1 || l == 5 || l == 24 || l == 47)
+            std::printf("  layer %2d (%s): %7.1f %7.1f %7.1f %7.1f\n", l, g.is_swa(l) ? "SWA   " : "global",
+                        prof_us_[(size_t) l * 4] / prof_windows_, prof_us_[(size_t) l * 4 + 1] / prof_windows_,
+                        prof_us_[(size_t) l * 4 + 2] / prof_windows_, prof_us_[(size_t) l * 4 + 3] / prof_windows_);
+    }
+    std::printf("  mean          : %7.1f %7.1f %7.1f %7.1f   (x %d layers = %.2f ms)\n", sum[0] / n, sum[1] / n,
+                sum[2] / n, sum[3] / n, n, (sum[0] + sum[1] + sum[2] + sum[3]) / 1000.0);
 }
 
 void MimoDecoder::dump(const char* name, int layer, const void* dev, size_t bytes_per_token, int T, bool is_int) {

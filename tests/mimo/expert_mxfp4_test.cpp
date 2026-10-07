@@ -371,7 +371,7 @@ int main(int argc, char** argv) {
         std::vector<uint8_t> blob(kMxSlotBytes), raw(kMxSlotBytes), back(kMxSlotBytes);
         void* d_raw;
         CK(cudaMalloc(&d_raw, kMxSlotBytes));
-        const int n_slots = do_bench ? 192 : n_real;
+        const int n_slots = do_bench ? (std::getenv("MIMO_BENCH_SLOTS") ? std::atoi(std::getenv("MIMO_BENCH_SLOTS")) : 192) : n_real;
         std::vector<void*> slot_mem((size_t) n_slots);
         for (auto& p : slot_mem) CK(cudaMalloc(&p, kMxSlotBytes));
         bool relayout_ok = true;

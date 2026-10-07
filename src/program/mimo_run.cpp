@@ -41,6 +41,7 @@ int main(int argc, char** argv) {
         else if (a == "--cpu-experts") cfg.cpu_experts = std::atoi(argv[i + 1]) != 0;
         else if (a == "--ram-copy") cfg.ram_copy = std::atoi(argv[i + 1]) != 0;
         else if (a == "--graph") cfg.graph = std::atoi(argv[i + 1]) != 0;
+        else if (a == "--profile-gpu") cfg.profile_gpu = std::atoi(argv[i + 1]) != 0;
         else {
             std::fprintf(stderr, "unknown option %s\n", a.c_str());
             return 2;
@@ -87,6 +88,7 @@ int main(int argc, char** argv) {
         const double pf = std::chrono::duration<double>(clk::now() - t0).count();
         std::printf("prompt: %d tokens in %.2f s (%.1f tok/s), first next token %d\n", pos, pf, pos / pf, next[last]);
         const DecoderStats before = dec.stats();
+        dec.reset_profile();   // the generation's windows only
         std::vector<int32_t> out;
         int32_t tok = next[last];
         t0 = clk::now();
@@ -104,9 +106,11 @@ int main(int argc, char** argv) {
             const DecoderStats& st = dec.stats();
             const double uses = (double) (st.expert_uses - before.expert_uses);
             std::printf("generated %d tokens in %.2f s (%.2f tok/s); resident hit rate %.1f%%, %.1f experts staged per "
-                        "token, CPU experts %.2f ms per token\n",
+                        "token, CPU experts %.2f ms per token, waiting for the GPU %.2f ms per token\n",
                         generate, gs, generate / gs, 100.0 * (st.expert_hits - before.expert_hits) / uses,
-                        (double) (st.staged - before.staged) / generate, (st.cpu_ms - before.cpu_ms) / generate);
+                        (double) (st.staged - before.staged) / generate, (st.cpu_ms - before.cpu_ms) / generate,
+                        (st.wait_ms - before.wait_ms) / generate);
+            dec.print_profile();
             std::printf("tokens:");
             for (int32_t t : out) std::printf(" %d", t);
             std::printf("\n");
