@@ -26,6 +26,7 @@
 //   mimo_rmsnorm(x, attn_norm, h)  ->  attn_qkv GEMV (h -> qkv)  ->  mimo_qkv_rope_append(qkv, pos0, ..., q)
 //   ->  mimo_attn_decode(q, pos0, ..., a)  ->  attn_output GEMV (a -> y)  ->  mimo_residual_add(x, y, value_scale)
 // with pos0 one device int32 written before the graph launch (the first position of the window).
+// Prompt chunks (P up to 4096 tokens) use mimo_qkv_rope_append_prompt + mimo_attn_prompt, declared at the end.
 //
 // Rollback: a rejected speculative token needs nothing - the next window starts at the accepted length, rewrites
 // those positions, and attention never reads past pos0 + T. The ring is safe for the same reason: a window at pos0
@@ -102,5 +103,55 @@ void mimo_attn_decode(const float* q, const int32_t* pos0, int T, const AttnLaye
 
 /// x += scale * y (n floats): the residual add after attn_output, scale = value_scale.
 void mimo_residual_add(float* x, const float* y, float scale, int n, void* stream);
+
+// ---- Prompt processing (prefill): a chunk of P tokens at positions pos0 .. pos0+P-1 -----------------------------
+//
+// Same cache, same math, same quantizer as the decode path above, so a prompt chunk and the decode windows after it
+// (or chunks of any other size) leave the same int8 codes and give the same outputs up to the kernels' roundings.
+// pos0 is a host int here (prefill is not graph-captured: the grid depends on P and the split-K plan on pos0).
+//
+// Sliding-window layers: the ring holds 256 positions, but a chunk of P > 129 tokens needs, for its queries, up to
+// n_swa - 1 keys before each of them - more than the ring can hold at once while the chunk is being written. So the
+// chunk goes through a linear staging buffer (AttnPromptScratch::swa, the same int8 format) that holds positions
+// pos0 - n_swa .. pos0 + P - 1 at rows 0 .. n_swa + P - 1:
+//   mimo_qkv_rope_append_prompt  1. copies the ring's positions pos0 - n_swa .. pos0 - 1 into staging rows 0..n_swa-1
+//                                2. ropes and quantizes the chunk into staging rows n_swa .. n_swa + P - 1, and the
+//                                   last min(P, 256) of its positions also into the ring (slot = pos % 256), which
+//                                   then holds positions >= pos0 + P - 256: what the next decode window or chunk reads
+//   mimo_attn_prompt             reads the staging only (the ring is not read, so step 2 may overwrite it freely).
+// The staging is shared by all SWA layers: each layer's append must be followed by its own attention before the
+// next SWA layer's append. Global layers read and write their cache by position directly (cap >= pos0 + P).
+//
+// Attention runs on the tensor cores (mma.sync m16n8k16, f16 in, f32 accumulate), flash-attention style: a block
+// takes 128 query rows of one KV head (rows r = t * G + head-in-group, so 8 tokens on a global layer, 16 on an SWA
+// one, share every K/V tile) and streams 64-key tiles, each dequantized once into shared memory as f16. Long prior
+// contexts with few blocks split the keys (split-K) and merge in a second kernel, through AttnPromptScratch::o / ml.
+
+inline constexpr int kAttnPromptMaxP = 4096;   // default chunk capacity of the prompt scratch
+
+/// The prompt path's scratch, shared by every layer.
+struct AttnPromptScratch {
+    AttnKv swa;                  // SWA staging: n_kv_swa heads x (max_p + n_swa) linear rows, the cache's format
+    int max_p = 0, n_swa = 0;
+    float* o = nullptr;          // split-K partials: [rows][128] unnormalized outputs
+    float* ml = nullptr;         // [rows][2]: running max (log2 units) and denominator
+    size_t part_rows = 0;        // capacity of o / ml in rows (splits x n_kv x padded query rows of one chunk)
+};
+/// max_p <= 0: kAttnPromptMaxP. part_bytes: the split-K partial buffer (0: 64 MiB; it only limits the split count).
+bool attn_prompt_scratch_alloc(AttnPromptScratch& s, int max_p, int n_kv_swa, int n_swa, size_t part_bytes,
+                               std::string& err);
+void attn_prompt_scratch_free(AttnPromptScratch& s);
+
+/// qkv [P][rows] F32 (the decode path's layout) -> roped q [P][n_head][192] as fp16 bits (q_out), k (roped) and v
+/// quantized into the cache (global) or the staging + ring (SWA), as described above. 1 <= P <= s.max_p.
+void mimo_qkv_rope_append_prompt(const float* qkv, int pos0, int P, const AttnLayer& L, const AttnKv& kv,
+                                 const AttnPromptScratch& s, uint16_t* q_out, void* stream);
+
+/// Causal attention of the P roped queries (fp16, from mimo_qkv_rope_append_prompt of the same layer and chunk)
+/// over keys [0, pos0 + t] (global) or (pos0 + t - n_swa, pos0 + t] (SWA, from the staging), GQA, sinks.
+/// out: [P][n_head][128] F32. splits <= 0 chooses the split-K count itself (1 unless the prior context is long and
+/// the chunk's blocks would not fill the GPU evenly).
+void mimo_attn_prompt(const uint16_t* q, int pos0, int P, const AttnLayer& L, const AttnKv& kv,
+                      const AttnPromptScratch& s, float* out, void* stream, int splits = 0);
 
 }  // namespace strata::mimo

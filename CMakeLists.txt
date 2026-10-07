@@ -467,6 +467,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(mimo_attn_test PRIVATE strata_mimo)
     add_test(NAME mimo_attn_test COMMAND mimo_attn_test)
     set_tests_properties(mimo_attn_test PROPERTIES SKIP_RETURN_CODE 77)
+    # prompt (prefill) attention: CPU reference, chunked vs decode consistency; --bench for timings
+    add_executable(mimo_attn_prompt_test tests/cuda/mimo_attn_prompt_test.cpp)
+    target_link_libraries(mimo_attn_prompt_test PRIVATE strata_mimo)
+    add_test(NAME mimo_attn_prompt_test COMMAND mimo_attn_prompt_test)
+    set_tests_properties(mimo_attn_prompt_test PROPERTIES SKIP_RETURN_CODE 77)
   endif()
 
   if(STRATA_ENABLE_HIP)
