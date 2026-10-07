@@ -7,6 +7,8 @@
 #include "strata/mimo/cpu_experts.hpp"
 #include "strata/mimo/expert_mxfp4.hpp"
 #include "strata/mimo/ops.hpp"
+#include "strata/mimo/prefill_moe.hpp"
+#include "strata/prefill/gemm.hpp"
 #include "strata/mimo/router.hpp"
 
 #include <cuda_runtime.h>
@@ -72,6 +74,9 @@ MimoDecoder::~MimoDecoder() {
     for (auto& ge : mtp_graphs_)
         if (ge) cudaGraphExecDestroy(ge);
     attn_kv_free(mtp_kv_);
+    attn_prompt_scratch_free(aps_);
+    pmoe_.reset();
+    gemm_.reset();
     if (mtp_arena_) cudaFree(mtp_arena_);
     for (void* p : {(void*) h_x_, (void*) h_w_, (void*) h_out_, (void*) h_ids_, (void*) h_seq_, (void*) h_flag_})
         if (p) cudaFreeHost(p);
@@ -81,7 +86,10 @@ MimoDecoder::~MimoDecoder() {
     if (pinned_) cudaFreeHost(pinned_);
     cpu_.reset();
     pool_.reset();
-    for (void* p : ram_) std::free(p);
+    for (void* p : ram_) {
+        if (cfg_.batched_prefill) PrefillMoe::unregister_host(p);
+        std::free(p);
+    }
     for (void* p : {(void*) h_host_, (void*) wt_host_, (void*) cpu_out_host_, (void*) ids_host_})
         if (p) cudaFreeHost(p);
     if (prev_affinity_ >= 0) cpu::restore_thread_affinity(prev_affinity_);
@@ -130,6 +138,7 @@ bool MimoDecoder::init(std::string& err) {
             !dev(kMaxT * 4, &mtp_tok_) || !dev(4, &mtp_pos0_) || !load_mtp(err))
             return false;
     }
+    if (cfg_.batched_prefill && cfg_.cpu_experts && cfg_.graph && !prefill_alloc(err)) return false;
     // v1: the CPU computes the non-resident experts, from a RAM copy of every MoE layer
     if (cfg_.cpu_experts) {
         // MIMO_HOST_CORE=last: the host loop on the last physical core and one worker fewer, away from core 0
@@ -235,6 +244,15 @@ bool MimoDecoder::init(std::string& err) {
         return false;
     cudaMemGetInfo(&free_b, &total_b);
     vram_free_after_init_ = free_b;
+    // the RAM copy pinned, so the prompt path's copies of non-resident experts run at full PCIe speed - LAST: on
+    // Windows, registering ~150 GB of host memory lowers the free VRAM cudaMemGetInfo reports by tens of GiB, which
+    // would have shrunk the expert budget measured above
+    if (cfg_.batched_prefill && pmoe_) {
+        size_t i = 0;
+        for (int l = 0; l < g.n_layer; ++l)
+            if (g.is_moe(l) && i < ram_.size() && !PrefillMoe::register_host(ram_[i++], cpu_->layer_bytes(l), err))
+                return false;
+    }
     return true;
 }
 
@@ -355,6 +373,7 @@ bool MimoDecoder::mtp_forward(const int32_t* tokens, int T, int pos0, int32_t* d
 
 bool MimoDecoder::prompt(const int32_t* tokens, int n, int pos0, const ChooseFn& choose, int32_t* first,
                          int32_t* draft, const std::function<void(int)>& progress, std::string& err) {
+    if (pmoe_ && n > 64) return prompt_batched(tokens, n, pos0, choose, first, draft, progress, err);
     constexpr int W = kMaxT;
     const int V = model_.geometry().n_vocab;
     int32_t next[kMaxT], dr[kMaxT];

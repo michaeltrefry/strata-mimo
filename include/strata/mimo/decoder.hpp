@@ -23,10 +23,12 @@
 #include <vector>
 
 namespace strata::kernels::cpu { class ExpertPool; }
+namespace strata::prefill { class Gemm; }
 
 namespace strata::mimo {
 
 class CpuExperts;
+class PrefillMoe;
 
 struct DecoderConfig {
     int max_ctx = 262144;           // positions of the global layers' KV caches
@@ -38,6 +40,9 @@ struct DecoderConfig {
     bool graph = true;              // v2: one CUDA graph per window size, the CPU handoff inside it (no dump)
     bool profile_gpu = false;       // v2: GPU timestamps per layer (print_profile)
     std::string mtp_path;           // the MTP GGUF (mtp-*.gguf): enables mtp_forward (draft head = its first layer)
+    bool batched_prefill = true;    // prompts of more than 64 tokens through the batched path (src/mimo/prefill.cpp)
+    int prefill_slice = 4096;       // tokens per layer-major slice (each non-resident expert copied once per slice)
+    int prefill_tile = 2048;        // tokens per attention / dense GEMM tile within a slice
 };
 
 struct DecoderStats {
@@ -88,6 +93,16 @@ public:
 
 private:
     bool forward_graph(int T, int pos0, int32_t* next, std::string& err);
+    // the batched prompt path (src/mimo/prefill.cpp)
+    bool prefill_alloc(std::string& err);
+    bool prompt_batched(const int32_t* tokens, int n, int pos0, const ChooseFn& choose, int32_t* first, int32_t* draft,
+                        const std::function<void(int)>& progress, std::string& err);
+    void gemm_q8(const DevTensor& w, uint16_t* scratch, bool dequant, const uint16_t* x16, float* y, int T);
+    void prefill_attention(const DevTensor& attn_norm, const DevTensor& qkv, const DevTensor& out, const AttnLayer& L,
+                           const AttnKv& kv, float* x, int T, int pos, bool dq_qkv, bool dq_out);
+    void prefill_dense_ffn(const DevTensor& gate, const DevTensor& up, const DevTensor& down, const float* hn, float* x,
+                           int T);
+    void prefill_dump(const char* name, int layer, const float* dev, size_t floats_per_row, int rows);
     bool load_mtp(std::string& err);
     void mtp_enqueue(int T);
     bool capture(int T, std::string& err);
@@ -141,6 +156,14 @@ private:
     cudaGraphExec_t mtp_graphs_[9] = {};
     float *e_ = nullptr, *cat_ = nullptr, *mres_ = nullptr;
     int32_t *mtp_tok_ = nullptr, *mtp_pos0_ = nullptr;
+    // the batched prompt path's buffers (slice S, tile P)
+    std::unique_ptr<prefill::Gemm> gemm_;
+    std::unique_ptr<PrefillMoe> pmoe_;
+    AttnPromptScratch aps_{};
+    float *pX_ = nullptr, *pHn_ = nullptr, *pY_ = nullptr, *pW_ = nullptr, *pLogits_ = nullptr;   // [S][..]
+    float *pQkv_ = nullptr, *pA_ = nullptr, *pG_ = nullptr, *pU_ = nullptr, *pE_ = nullptr;        // [P][..]
+    int32_t *pIds_ = nullptr, *pTok_ = nullptr;
+    uint16_t *p16_ = nullptr, *pQ16_ = nullptr, *pW1_ = nullptr, *pW2_ = nullptr;                // FP16
     std::vector<double> prof_us_;              // accumulated [48 * 4] intervals
     int prof_windows_ = 0;
 };

@@ -427,7 +427,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
 
   # ---- MiMo-V2.6-Flash (docs/MIMO_PORT_PLAN.md) -------------------------------------------------------------
-  add_library(strata_mimo STATIC src/mimo/model.cpp src/mimo/router.cu src/mimo/ops.cu src/mimo/attn.cu src/mimo/decoder.cpp
+  add_library(strata_mimo STATIC src/mimo/model.cpp src/mimo/router.cu src/mimo/ops.cu src/mimo/attn.cu src/mimo/decoder.cpp src/mimo/prefill.cpp
                           src/mimo/cpu_experts.cpp)
   if(STRATA_ENABLE_CUDA)
     # step 3: the resident experts' MXFP4 kernels (CUDA only for now: inline PTX loads)
@@ -436,7 +436,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(strata_mimo PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   target_link_libraries(strata_mimo PUBLIC strata_artifact strata_warnings strata_kernels_cpu ${_strata_gpu_runtime_target})
   add_executable(strata-mimo-inspect src/program/mimo_inspect.cpp)
-  target_link_libraries(strata_mimo PUBLIC strata_kernels ${_strata_gpu_blas_target})
+  target_link_libraries(strata_mimo PUBLIC strata_kernels strata_prefill ${_strata_gpu_blas_target})
   add_executable(strata-mimo src/program/mimo_serve.cpp)
   target_link_libraries(strata-mimo PRIVATE strata_mimo)
   add_executable(strata-mimo-run src/program/mimo_run.cpp)

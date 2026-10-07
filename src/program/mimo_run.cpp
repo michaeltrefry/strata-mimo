@@ -43,6 +43,7 @@ int main(int argc, char** argv) {
         else if (a == "--graph") cfg.graph = std::atoi(argv[i + 1]) != 0;
         else if (a == "--profile-gpu") cfg.profile_gpu = std::atoi(argv[i + 1]) != 0;
         else if (a == "--mtp") cfg.mtp_path = argv[i + 1];
+        else if (a == "--batched") cfg.batched_prefill = std::atoi(argv[i + 1]) != 0;
         else {
             std::fprintf(stderr, "unknown option %s\n", a.c_str());
             return 2;
@@ -79,22 +80,13 @@ int main(int argc, char** argv) {
         int pos = 0, last = 0;   // next[last]: the prediction after the prompt's final token
         const bool mtp = dec.has_mtp();
         t0 = clk::now();
-        while (pos < (int) prompt.size()) {
-            const int T = std::min(window, (int) prompt.size() - pos);
-            if (!dec.forward(prompt.data() + pos, T, pos, next, nullptr, err)) {
-                std::fprintf(stderr, "FAIL at %d: %s\n", pos, err.c_str());
+        {   // the prompt (batched for long prompts unless --batched 0), then the first token greedily
+            auto greedy = [](const float*, int32_t g) { return g; };
+            if (!dec.prompt(prompt.data(), (int) prompt.size(), 0, greedy, &next[0], &draft[0], nullptr, err)) {
+                std::fprintf(stderr, "FAIL in the prompt: %s\n", err.c_str());
                 return 1;
             }
-            if (mtp) {   // the MTP layer's KV: position p pairs token p with the main model's state at p - 1
-                int32_t mt[8];
-                for (int t = 0; t < T; ++t) mt[t] = pos + t + 1 < (int) prompt.size() ? prompt[(size_t) (pos + t + 1)] : next[T - 1];
-                if (!dec.mtp_forward(mt, T, pos + 1, draft, err)) {
-                    std::fprintf(stderr, "FAIL (MTP) at %d: %s\n", pos, err.c_str());
-                    return 1;
-                }
-            }
-            pos += T;
-            last = T - 1;
+            pos = (int) prompt.size();
         }
         const double pf = std::chrono::duration<double>(clk::now() - t0).count();
         std::printf("prompt: %d tokens in %.2f s (%.1f tok/s), first next token %d\n", pos, pf, pos / pf, next[last]);

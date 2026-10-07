@@ -43,6 +43,8 @@ public:
     uint16_t* scratch() const { return scratch_; }
     int64_t scratch_elems() const { return scratch_elems_; }
     void* stream() const { return stream_; }
+    /// The cuBLAS handle (bound to stream()), for callers with their own products on it.
+    void* cublas() const { return handle_; }
 
 private:
     void* handle_ = nullptr;
