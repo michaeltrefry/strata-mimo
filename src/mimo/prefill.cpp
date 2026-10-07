@@ -11,6 +11,7 @@
 #include "strata/mimo/cpu_experts.hpp"
 #include "strata/mimo/ops.hpp"
 #include "strata/mimo/prefill_moe.hpp"
+#include "strata/mimo/expert_mxfp4.hpp"
 #include "strata/mimo/router.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/kernels.hpp"
@@ -122,6 +123,10 @@ bool MimoDecoder::prompt_batched(const int32_t* tokens, int n, int pos0, const C
     if (!cfg_.dump_dir.empty())
         std::ofstream(cfg_.dump_dir + "/tokens.i32", std::ios::binary | std::ios::app).write((const char*) tokens, 4 * (size_t) n);
     std::vector<int32_t> res(g.n_expert);
+    // the prompt's routing, for adapt_residency: picks per layer and expert
+    const bool adapt = n >= cfg_.adapt_min_prompt && !profile_score_.empty();
+    std::vector<std::vector<uint32_t>> counts(adapt ? (size_t) g.n_layer : 0, std::vector<uint32_t>((size_t) g.n_expert));
+    std::vector<int32_t> picks;
     std::vector<float> last_logits(V);
     for (int done = 0; done < n;) {
         const int S = std::min(cfg_.prefill_slice, n - done), base = pos0 + done;
@@ -162,6 +167,13 @@ bool MimoDecoder::prompt_batched(const int32_t* tokens, int n, int pos0, const C
                 ml.slot_addr = slot_addr_.data();
                 ml.ram = cpu_ ? cpu_->source(l) : model_.experts(l);
                 pmoe_->run_layer(ml, s);
+                if (adapt) {
+                    picks.resize((size_t) S * K);
+                    cudaMemcpyAsync(picks.data(), pIds_, sizeof(int32_t) * picks.size(), cudaMemcpyDeviceToHost, s);
+                    cudaStreamSynchronize(s);
+                    for (int32_t e : picks)
+                        if (e >= 0 && e < g.n_expert) ++counts[(size_t) l][(size_t) e];
+                }
                 add_scaled(pX_, pY_, 1.f, E * S, s);
             }
             prefill_dump("l_out", l, pX_, (size_t) E, S);
@@ -215,6 +227,57 @@ bool MimoDecoder::prompt_batched(const int32_t* tokens, int n, int pos0, const C
         if (!ok(cudaStreamSynchronize(s), "prompt slice", err)) return false;
         done += S;
     }
+    return adapt ? adapt_residency(counts, err) : true;
+}
+
+bool MimoDecoder::adapt_residency(const std::vector<std::vector<uint32_t>>& counts, std::string& err) {
+    const MimoGeometry& g = model_.geometry();
+    const auto t0 = std::chrono::steady_clock::now();
+    const float a = cfg_.adapt_weight;
+    // the blended score of every MoE expert: shares within its layer, so layers weigh the same
+    std::vector<std::pair<float, int>> rank;   // (score, layer * n_expert + e)
+    for (int l = 0; l < g.n_layer; ++l) {
+        if (!g.is_moe(l)) continue;
+        double tot = 0;
+        for (uint32_t c : counts[(size_t) l]) tot += c;
+        for (int e = 0; e < g.n_expert; ++e) {
+            const float prompt = tot > 0 ? (float) (counts[(size_t) l][(size_t) e] / tot) : 0.f;
+            const float prof = profile_score_[(size_t) l * g.n_expert + e];
+            rank.emplace_back((1.f - a) * prof + a * prompt, l * g.n_expert + e);
+        }
+    }
+    std::stable_sort(rank.begin(), rank.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
+    std::vector<char> keep((size_t) g.n_layer * g.n_expert, 0);
+    for (int i = 0; i < n_resident_ && i < (int) rank.size(); ++i) keep[(size_t) rank[(size_t) i].second] = 1;
+    std::vector<int> in, out;   // experts to load, resident experts to drop (their slots are reused)
+    for (int i = 0; i < n_resident_ && i < (int) rank.size(); ++i) {
+        const int id = rank[(size_t) i].second;
+        if (resident_[(size_t) (id / g.n_expert)][(size_t) (id % g.n_expert)] < 0) in.push_back(id);
+    }
+    for (int l = 0; l < g.n_layer; ++l)
+        for (int e = 0; e < g.n_expert; ++e)
+            if (resident_[(size_t) l][(size_t) e] >= 0 && !keep[(size_t) l * g.n_expert + e]) out.push_back(l * g.n_expert + e);
+    const size_t n = std::min(in.size(), out.size());
+    cudaStream_t s = stream_;
+    for (size_t i = 0; i < n; ++i) {
+        const int li = in[i] / g.n_expert, ei = in[i] % g.n_expert, lo = out[i] / g.n_expert, eo = out[i] % g.n_expert;
+        const int slot = resident_[(size_t) lo][(size_t) eo];
+        const ExpertSlices& src = cpu_ ? cpu_->source(li) : model_.experts(li);   // the pinned RAM copy
+        uint8_t* raw = (uint8_t*) raw_;
+        cudaMemcpyAsync(raw, src.matrix(0, ei), src.stride[0], cudaMemcpyHostToDevice, s);
+        cudaMemcpyAsync(raw + src.stride[0], src.matrix(1, ei), src.stride[1], cudaMemcpyHostToDevice, s);
+        cudaMemcpyAsync(raw + src.stride[0] + src.stride[1], src.matrix(2, ei), src.stride[2], cudaMemcpyHostToDevice, s);
+        mxfp4_slot_relayout(raw, (void*) slot_addr_[(size_t) slot], s);
+        resident_[(size_t) lo][(size_t) eo] = -1;
+        resident_[(size_t) li][(size_t) ei] = slot;
+    }
+    std::vector<int32_t> flat;
+    for (const auto& r : resident_) flat.insert(flat.end(), r.begin(), r.end());
+    if (!ok(cudaMemcpyAsync(d_res_, flat.data(), sizeof(int32_t) * flat.size(), cudaMemcpyHostToDevice, s), "residency", err) ||
+        !ok(cudaStreamSynchronize(s), "residency swap", err))
+        return false;
+    stats_.swapped += n;
+    stats_.swap_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return true;
 }
 

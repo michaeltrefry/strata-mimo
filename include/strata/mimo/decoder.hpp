@@ -43,6 +43,8 @@ struct DecoderConfig {
     bool batched_prefill = true;    // prompts of more than 64 tokens through the batched path (src/mimo/prefill.cpp)
     int prefill_slice = 16384;       // tokens per layer-major slice (each non-resident expert copied once per slice)
     int prefill_tile = 2048;        // tokens per attention / dense GEMM tile within a slice
+    int adapt_min_prompt = 2048;    // after a batched prompt this long, the resident set follows its routing too
+    float adapt_weight = 0.5f;      // the prompt's share in the blended score (the profile has the rest)
 };
 
 struct DecoderStats {
@@ -50,6 +52,8 @@ struct DecoderStats {
     uint64_t staged = 0;                         // experts copied into a staging slot (distinct per window and layer)
     double cpu_ms = 0;                           // time spent in CpuExperts::run_layer
     double wait_ms = 0;                          // v2: host waiting for the GPU to reach the next MoE layer
+    uint64_t swapped = 0;                        // experts moved into resident slots after prompts
+    double swap_ms = 0;
 };
 
 class MimoDecoder {
@@ -103,6 +107,9 @@ private:
     void prefill_dense_ffn(const DevTensor& gate, const DevTensor& up, const DevTensor& down, const float* hn, float* x,
                            int T);
     void prefill_dump(const char* name, int layer, const float* dev, size_t floats_per_row, int rows);
+    /// Re-ranks the experts by the profile blended with `counts` (a prompt's picks per layer and expert) and moves
+    /// the best non-resident ones into the slots of the worst resident ones.
+    bool adapt_residency(const std::vector<std::vector<uint32_t>>& counts, std::string& err);
     bool load_mtp(std::string& err);
     void mtp_enqueue(int T);
     bool capture(int T, std::string& err);
@@ -129,6 +136,7 @@ private:
     int n_resident_ = 0, n_staging_ = 0;
     size_t vram_free_after_init_ = 0;
     std::vector<std::vector<int>> resident_;   // [layer][expert] -> slot, -1 = not resident
+    std::vector<float> profile_score_;         // [layer][expert] the profile's share of its layer's picks
     std::vector<unsigned long long> slot_addr_;
     // v1: the CPU's share
     std::unique_ptr<kernels::cpu::ExpertPool> pool_;

@@ -191,6 +191,7 @@ bool MimoDecoder::init(std::string& err) {
     if (want > 0) {
         std::vector<float> score;
         if (!read_profile(cfg_.profile, g.n_layer, g.n_expert, score, err)) return false;
+        profile_score_ = score;
         std::vector<int> order(score.size());
         std::iota(order.begin(), order.end(), 0);
         std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return score[(size_t) a] > score[(size_t) b]; });

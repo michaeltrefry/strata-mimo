@@ -44,6 +44,7 @@ int main(int argc, char** argv) {
         else if (a == "--profile-gpu") cfg.profile_gpu = std::atoi(argv[i + 1]) != 0;
         else if (a == "--mtp") cfg.mtp_path = argv[i + 1];
         else if (a == "--batched") cfg.batched_prefill = std::atoi(argv[i + 1]) != 0;
+        else if (a == "--adapt") cfg.adapt_weight = std::strtof(argv[i + 1], nullptr);
         else {
             std::fprintf(stderr, "unknown option %s\n", a.c_str());
             return 2;
@@ -89,7 +90,8 @@ int main(int argc, char** argv) {
             pos = (int) prompt.size();
         }
         const double pf = std::chrono::duration<double>(clk::now() - t0).count();
-        std::printf("prompt: %d tokens in %.2f s (%.1f tok/s), first next token %d\n", pos, pf, pos / pf, next[last]);
+        std::printf("prompt: %d tokens in %.2f s (%.1f tok/s), first next token %d; %llu experts swapped in after it (%.0f ms)\n",
+                    pos, pf, pos / pf, next[last], (unsigned long long) dec.stats().swapped, dec.stats().swap_ms);
         const DecoderStats before = dec.stats();
         dec.reset_profile();   // the generation's windows only
         std::vector<int32_t> out;
