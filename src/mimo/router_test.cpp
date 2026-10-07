@@ -2,7 +2,11 @@
 // selection biases (layers 1, 24, 47), T = 1..8 random hidden states.  Prints the largest logit / weight error,
 // how many picks differ (only possible at a near-tie in the selection score) and the time per layer.
 //
-// usage: mimo_router_test <any shard of the model>
+// With a llama-mimo-dump directory as the second argument it also runs the router on llama.cpp's own router inputs
+// (ffn_norm-L) for every dumped token and layer and compares the picks (as sets) and weights with llama.cpp's
+// (ffn_moe_topk-L, ffn_moe_weights_norm-L).
+//
+// usage: mimo_router_test <any shard of the model> [dump dir]
 #include "strata/mimo/model.hpp"
 #include "strata/mimo/router.hpp"
 
@@ -12,6 +16,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <fstream>
+#include <set>
 #include <numeric>
 #include <random>
 #include <vector>
@@ -121,6 +127,72 @@ int main(int argc, char** argv) {
     std::printf("largest logit error (relative to sum |w h|) %.2e, weight error %.2e; %d of %d picks differ from the reference\n",
                 worst_logit, worst_w, pick_diff, picks);
     ok = worst_logit < 1e-5 && worst_w < 1e-4 && pick_diff == 0;
+    if (argc > 2) {   // against llama.cpp's own routing
+        auto load = [&](const std::string& name, size_t n, void* dst) {
+            std::ifstream f(std::string(argv[2]) + "/" + name, std::ios::binary);
+            return (bool) f.read((char*) dst, (std::streamsize) n);
+        };
+        std::ifstream tf(std::string(argv[2]) + "/tokens.i32", std::ios::binary | std::ios::ate);
+        const int n_tok = (int) (tf.tellg() / 4);
+        int set_diff = 0, total = 0, mine_exact = 0, ref_exact = 0, neither_exact = 0;
+        double worst_ref_w = 0;
+        std::vector<float> x((size_t) n_tok * E), rw((size_t) n_tok * K);
+        std::vector<int> rid((size_t) n_tok * K);
+        for (int l = 0; l < g.n_layer; ++l) {
+            if (!g.is_moe(l)) continue;
+            const std::string L = std::to_string(l), b = "blk." + L + ".";
+            if (!load("ffn_norm-" + L + ".f32", x.size() * 4, x.data()) ||
+                !load("ffn_moe_topk-" + L + ".i32", rid.size() * 4, rid.data()) ||
+                !load("ffn_moe_weights_norm-" + L + ".f32", rw.size() * 4, rw.data())) {
+                std::fprintf(stderr, "FAIL: dump files of layer %d missing\n", l);
+                return 1;
+            }
+            cudaMemcpy(d_w, model.host_data(b + "ffn_gate_inp.weight"), sizeof(float) * E * N, cudaMemcpyHostToDevice);
+            cudaMemcpy(d_b, model.host_data(b + "exp_probs_b.bias"), sizeof(float) * N, cudaMemcpyHostToDevice);
+            for (int t0 = 0; t0 < n_tok; t0 += kRouterMaxT) {
+                const int T = std::min(kRouterMaxT, n_tok - t0);
+                cudaMemcpy(d_h, x.data() + (size_t) t0 * E, sizeof(float) * T * E, cudaMemcpyHostToDevice);
+                router_logits(d_w, d_h, d_logits, T, E, N, nullptr);
+                router_topk(d_logits, d_b, d_ids, d_wt, T, N, K, g.expert_weights_scale, nullptr);
+                std::vector<int> ids((size_t) T * K);
+                std::vector<float> wt((size_t) T * K);
+                cudaMemcpy(ids.data(), d_ids, sizeof(int) * ids.size(), cudaMemcpyDeviceToHost);
+                cudaMemcpy(wt.data(), d_wt, sizeof(float) * wt.size(), cudaMemcpyDeviceToHost);
+                for (int t = 0; t < T; ++t) {
+                    ++total;
+                    std::set<int> mine(ids.begin() + t * K, ids.begin() + (t + 1) * K);
+                    std::set<int> ref(rid.begin() + (size_t) (t0 + t) * K, rid.begin() + (size_t) (t0 + t + 1) * K);
+                    if (mine != ref) {   // which side does exact arithmetic agree with?
+                        ++set_diff;
+                        const float* w = reinterpret_cast<const float*>(model.host_data(b + "ffn_gate_inp.weight"));
+                        const float* bias = reinterpret_cast<const float*>(model.host_data(b + "exp_probs_b.bias"));
+                        std::vector<double> sel(N);
+                        for (int e = 0; e < N; ++e) {
+                            double acc = 0;
+                            for (int i = 0; i < E; ++i) acc += (double) w[(size_t) e * E + i] * x[(size_t) (t0 + t) * E + i];
+                            sel[e] = 1.0 / (1.0 + std::exp(-acc)) + bias[e];
+                        }
+                        std::vector<int> order(N);
+                        std::iota(order.begin(), order.end(), 0);
+                        std::partial_sort(order.begin(), order.begin() + K, order.end(), [&](int a, int c) { return sel[a] > sel[c]; });
+                        const std::set<int> exact(order.begin(), order.begin() + K);
+                        (exact == mine ? mine_exact : exact == ref ? ref_exact : neither_exact)++;
+                        continue;
+                    }
+                    for (int j = 0; j < K; ++j)
+                        for (int r = 0; r < K; ++r)
+                            if (rid[(size_t) (t0 + t) * K + r] == ids[(size_t) t * K + j])
+                                worst_ref_w = std::max(worst_ref_w, (double) std::fabs(rw[(size_t) (t0 + t) * K + r] - wt[(size_t) t * K + j]));
+                }
+            }
+        }
+        std::printf("against llama.cpp (%d tokens x %d layers): %d of %d expert sets differ, largest weight difference %.2e\n",
+                    n_tok, g.count_moe(), set_diff, total, worst_ref_w);
+        std::printf("  of those, exact (double) arithmetic picks this router's set %d times, llama.cpp's %d, neither %d\n",
+                    mine_exact, ref_exact, neither_exact);
+        ok = ok && ref_exact == 0;   // llama.cpp may round its router (cuBLAS); this one must not be the one that is off
+    }
+    ok = ok && worst_w < 1e-4 && pick_diff == 0;
     std::printf("%s\n", ok ? "OK" : "FAIL");
     return ok ? 0 : 1;
 }
