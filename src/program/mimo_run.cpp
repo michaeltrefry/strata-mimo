@@ -27,11 +27,12 @@ int main(int argc, char** argv) {
     }
     DecoderConfig cfg;
     cfg.max_ctx = 32768;
-    std::string tokens_path;
+    std::string tokens_path, force_path;   // --force: generate exactly these tokens (2-token windows, no MTP)
     int generate = 0, window = 8;
     for (int i = 2; i + 1 < argc; i += 2) {
         const std::string a = argv[i];
         if (a == "--tokens") tokens_path = argv[i + 1];
+        else if (a == "--force") force_path = argv[i + 1];
         else if (a == "--generate") generate = std::atoi(argv[i + 1]);
         else if (a == "--profile") cfg.profile = argv[i + 1];
         else if (a == "--budget-gib") cfg.expert_budget_gib = std::atof(argv[i + 1]);
@@ -105,7 +106,33 @@ int main(int argc, char** argv) {
         int windows = 0, accepted = 0;
         double ms_main = 0, ms_mtp = 0;
         t0 = clk::now();
-        if (mtp) {
+        if (!force_path.empty()) {
+            // the same answer for every model: windows [f_i, f_i+1] at fixed positions, the main model's own picks
+            // ignored - so the speed and the residency compare on identical routing input
+            std::vector<int32_t> forced;
+            {
+                std::ifstream f(force_path, std::ios::binary);
+                int32_t v;
+                while (f.read((char*) &v, 4)) forced.push_back(v);
+            }
+            forced.resize(std::min(forced.size(), (size_t) generate));
+            size_t agree = 0;
+            for (size_t i = 0; i + 1 < forced.size(); i += 2) {
+                int32_t win[2] = {forced[i], forced[i + 1]};
+                if (!dec.forward(win, 2, pos, next, nullptr, err)) {
+                    std::fprintf(stderr, "FAIL at %d: %s\n", pos, err.c_str());
+                    return 1;
+                }
+                agree += next[0] == forced[i + 1];
+                if (i + 2 < forced.size()) agree += next[1] == forced[i + 2];
+                out.push_back(forced[i]);
+                out.push_back(forced[i + 1]);
+                pos += 2;
+            }
+            std::printf("forced: %zu tokens; this model's own pick agreed with the forced next token at %.1f%% of them\n",
+                        out.size(), 100.0 * agree / std::max<size_t>(1, out.size() - 1));
+            generate = (int) out.size();
+        } else if (mtp) {
             // verify [tok, d] at pos: the main model's prediction after tok decides whether d stands; the MTP layer
             // then takes the accepted positions (and drafts the next d from the last of them)
             int32_t d = draft[last];
