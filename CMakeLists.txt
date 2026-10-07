@@ -426,10 +426,24 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
 
   # ---- MiMo-V2.6-Flash (docs/MIMO_PORT_PLAN.md) -------------------------------------------------------------
   add_library(strata_mimo STATIC src/mimo/model.cpp)
+  if(STRATA_ENABLE_CUDA)
+    # step 3: the resident experts' MXFP4 kernels (CUDA only for now: inline PTX loads)
+    target_sources(strata_mimo PRIVATE src/mimo/kernels/expert_mxfp4.cu)
+  endif()
   target_include_directories(strata_mimo PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   target_link_libraries(strata_mimo PUBLIC strata_artifact strata_warnings ${_strata_gpu_runtime_target})
   add_executable(strata-mimo-inspect src/program/mimo_inspect.cpp)
   target_link_libraries(strata-mimo-inspect PRIVATE strata_mimo)
+  if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND STRATA_NATIVE_EXPERTS)
+    # the MXFP4 expert kernels on real experts against ggml's dequantizer (needs the model: not a ctest);
+    # --bench times them, see docs/MIMO_GPU_EXPERTS.md
+    add_executable(mimo_expert_mxfp4_test tests/mimo/expert_mxfp4_test.cpp)
+    target_link_libraries(mimo_expert_mxfp4_test PRIVATE strata_mimo ggml-base)
+    # Q8_0 MMVQ (native_mmvq) on MiMo's dense shapes: synthetic weights, timing only
+    add_executable(mimo_dense_q8_0_bench tests/mimo/dense_q8_0_bench.cu)
+    target_include_directories(mimo_dense_q8_0_bench PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(mimo_dense_q8_0_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  endif()
 
   if(STRATA_ENABLE_HIP)
     enable_testing()
