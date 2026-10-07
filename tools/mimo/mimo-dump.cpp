@@ -5,7 +5,9 @@
 //        (or MIMO_DUMP_TOKENS=<file of int32 token ids> instead of -p)
 // writes <dir>/tokens.i32 and one <name>.f32 / .i32 per captured tensor (<name> = llama.cpp's, e.g. "l_out-17"),
 // each a raw little-endian array of ne0 x ne1 (x ne2) values, plus <dir>/index.txt: "name type ne0 ne1 ne2".
-// Every token is an output, so the last layer runs for all of them.
+// Every token is an output, so the last layer runs for all of them.  Use a small -ub (e.g. 8): each ubatch appends
+// its rows, and llama.cpp's large-batch CPU MoE path for MXFP4 is not accurate (11-30% off on 311-token batches,
+// 0.9% at 4 tokens, measured against an exact float computation).
 #include "arg.h"
 #include "common.h"
 #include "log.h"
@@ -29,7 +31,8 @@ static const char * kCapture[] = {
 struct dump_state {
     std::string dir;
     FILE * index = nullptr;
-    std::set<std::string> written;   // first tensor of a name wins (llama.cpp reuses some names)
+    std::set<std::string> written;   // first tensor of a name per ubatch wins (llama.cpp reuses some names)
+    std::set<std::string> indexed;
 };
 
 static bool wanted(const char * name) {
@@ -44,6 +47,7 @@ static bool dump_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     auto * st = (dump_state *) user_data;
     if (!wanted(t->name) || strchr(t->name, ' ')) return ask ? false : true;   // no "(view)" / "(reshaped)" copies
     if (ask) return true;
+    if (strcmp(t->name, "attn_norm-0") == 0) st->written.clear();   // a new ubatch: its tensors append to the files
     if (!st->written.insert(t->name).second) return true;
     if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_I32) return true;
     // dense copy of a possibly strided tensor (up to 3 dims)
@@ -54,11 +58,12 @@ static bool dump_cb(struct ggml_tensor * t, bool ask, void * user_data) {
         for (int64_t i1 = 0; i1 < t->ne[1]; ++i1, ++r)
             ggml_backend_tensor_get(t, buf.data() + r * row, i1 * t->nb[1] + i2 * t->nb[2], row);
     const std::string path = st->dir + "/" + t->name + (t->type == GGML_TYPE_I32 ? ".i32" : ".f32");
-    FILE * f = fopen(path.c_str(), "wb");
+    FILE * f = fopen(path.c_str(), "ab");
     if (f) {
         fwrite(buf.data(), 1, buf.size(), f);
         fclose(f);
     }
+    if (!st->indexed.insert(t->name).second) return true;
     fprintf(st->index, "%s %s %lld %lld %lld\n", t->name, ggml_type_name(t->type), (long long) t->ne[0],
             (long long) t->ne[1], (long long) t->ne[2]);
     return true;
@@ -98,8 +103,8 @@ int main(int argc, char ** argv) {
     } else {
         toks = common_tokenize(ctx, params.prompt, llama_vocab_get_add_bos(llama_model_get_vocab(model)), true);
     }
-    if (toks.empty() || (int) toks.size() > (int) llama_n_ubatch(ctx)) {
-        LOG_ERR("need 1..n_ubatch tokens, got %zu\n", toks.size());
+    if (toks.empty() || (int) toks.size() > (int) llama_n_batch(ctx)) {
+        LOG_ERR("need 1..n_batch tokens, got %zu\n", toks.size());
         return 1;
     }
     FILE * tf = fopen((st.dir + "/tokens.i32").c_str(), "wb");
