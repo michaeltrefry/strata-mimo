@@ -6,6 +6,7 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/mimo/cpu_experts.hpp"
 #include "strata/mimo/expert_mxfp4.hpp"
+#include "strata/mimo/fused.hpp"
 #include "strata/mimo/ops.hpp"
 #include "strata/mimo/prefill_moe.hpp"
 #include "strata/prefill/gemm.hpp"
@@ -45,6 +46,10 @@ void q8_0_gemv(const DevTensor& w, const float* x, void* q8, float* y, int T, cu
     }
     strata::kernels::native_quantize_q8_1(x, q8, (int) w.ne0, T, s);
     strata::kernels::native_mmvq((int) w.type, w.data, q8, y, (int) w.ne0, (int) w.ne1, T, s);
+}
+// the same with x already quantized (mimo_add_rmsnorm_q8_1, mimo_attn_decode's q8_1 output)
+void q8_0_mmvq(const DevTensor& w, const void* q8, float* y, int T, cudaStream_t s) {
+    strata::kernels::native_q8_0_mmvq(w.data, q8, y, (int) w.ne0, (int) w.ne1, T, s);
 }
 
 // MIMOPROF v1 (tools/mimo/make_profile.py): score[layer][expert]
@@ -369,21 +374,24 @@ void MimoDecoder::mtp_layer_enqueue(const MtpLayer& m, const AttnKv& kv, const A
     mimo_rmsnorm(hsrc, (const float*) m.hnorm.data, h_, E, T, g.rms_eps, s);
     concat_rows(e_, h_, cat_, T, E, s);
     q8_0_gemv(m.eh_proj, cat_, q8_, mres, T, s);
-    mimo_rmsnorm(mres, (const float*) m.attn_norm.data, h_, E, T, g.rms_eps, s);
-    q8_0_gemv(m.attn_qkv, h_, q8_, qkv_, T, s);
+    mimo_add_rmsnorm_q8_1(mres, nullptr, nullptr, 1.f, (const float*) m.attn_norm.data, h_, q8_, false, E, T,
+                          g.rms_eps, s);
+    q8_0_mmvq(m.attn_qkv, q8_, qkv_, T, s);
     mimo_qkv_rope_append(qkv_, pos, T, al, kv, q_, s);
-    mimo_attn_decode(q_, pos, T, al, kv, attn_scratch_, a_, s);
-    q8_0_gemv(m.attn_output, a_, q8_, y_, T, s);
-    mimo_residual_add(mres, y_, g.value_scale, E * T, s);
-    mimo_rmsnorm(mres, (const float*) m.ffn_norm.data, h_, E, T, g.rms_eps, s);
-    q8_0_gemv(m.ffn_gate, h_, q8_, g_, T, s);
-    q8_0_gemv(m.ffn_up, h_, q8_, u_, T, s);
+    mimo_attn_decode(q_, pos, T, al, kv, attn_scratch_, a_, s, 0, q8_);
+    q8_0_mmvq(m.attn_output, q8_, y_, T, s);
+    mimo_add_rmsnorm_q8_1(mres, y_, nullptr, g.value_scale, (const float*) m.ffn_norm.data, h_, q8_, false, E, T,
+                          g.rms_eps, s);
+    q8_0_mmvq(m.ffn_gate, q8_, g_, T, s);
+    q8_0_mmvq(m.ffn_up, q8_, u_, T, s);
     silu_mul(g_, u_, m_, T * g.n_ff_dense, s);
     q8_0_gemv(m.ffn_down, m_, q8_, y_, T, s);
-    add_scaled(mres, y_, 1.f, E * T, s);
-    if (!head) return;
-    mimo_rmsnorm(mres, (const float*) m.out_norm.data, h_, E, T, g.rms_eps, s);
-    q8_0_gemv(model_.output(), h_, q8_, logits_, T, s);
+    if (!head) {
+        add_scaled(mres, y_, 1.f, E * T, s);
+        return;
+    }
+    mimo_add_rmsnorm_q8_1(mres, y_, nullptr, 1.f, (const float*) m.out_norm.data, h_, q8_, false, E, T, g.rms_eps, s);
+    q8_0_mmvq(model_.output(), q8_, logits_, T, s);
     argmax_rows(logits_, next_, T, g.n_vocab, s);
 }
 
@@ -614,6 +622,10 @@ bool MimoDecoder::capture(int T, std::string& err) {
     cudaGraph_t graph = nullptr;
     if (!cuda_ok(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal), "capture", err)) return false;
     embed_q8_0(model_.token_embd().data, tok_, x_, T, E, s);
+    // Each norm also writes its output as q8_1 for the GEMV after it; the end of a layer (its residual add, and for
+    // a MoE layer the CPU's sums) is one kernel with the next layer's attn_norm (docs/MIMO_DECODER.md).
+    mimo_add_rmsnorm_q8_1(x_, nullptr, nullptr, 1.f, (const float*) model_.layer(0).attn_norm.data, h_, q8_, false, E,
+                          T, g.rms_eps, s);
     uint32_t ring = 0;
     auto stamp = [&](int l, int i) {
         if (cfg_.profile_gpu) strata::kernels::gpu_stamp(stamps_, l * 5 + i, s);
@@ -622,39 +634,36 @@ bool MimoDecoder::capture(int T, std::string& err) {
         const LayerWeights& w = model_.layer(l);
         const AttnLayer& L = attn_[(size_t) l];
         stamp(l, 0);
-        mimo_rmsnorm(x_, (const float*) w.attn_norm.data, h_, E, T, g.rms_eps, s);
-        q8_0_gemv(w.attn_qkv, h_, q8_, qkv_, T, s);
+        q8_0_mmvq(w.attn_qkv, q8_, qkv_, T, s);
         mimo_qkv_rope_append(qkv_, pos0_, T, L, kv_[(size_t) l], q_, s);
-        mimo_attn_decode(q_, pos0_, T, L, kv_[(size_t) l], attn_scratch_, a_, s);
-        q8_0_gemv(w.attn_output, a_, q8_, y_, T, s);
-        mimo_residual_add(x_, y_, g.value_scale, E * T, s);
-        mimo_rmsnorm(x_, (const float*) w.ffn_norm.data, h_, E, T, g.rms_eps, s);
-        if (!g.is_moe(l)) {
-            q8_0_gemv(w.ffn_gate, h_, q8_, g_, T, s);
-            q8_0_gemv(w.ffn_up, h_, q8_, u_, T, s);
+        mimo_attn_decode(q_, pos0_, T, L, kv_[(size_t) l], attn_scratch_, a_, s, 0, q8_);
+        q8_0_mmvq(w.attn_output, q8_, y_, T, s);
+        // residual + ffn_norm; for a MoE layer also the doorbell's copy of h_ and the experts' q8_1 input, and y_
+        // becomes the experts' accumulator (zeroed)
+        const bool moe = g.is_moe(l);
+        mimo_add_rmsnorm_q8_1(x_, y_, nullptr, g.value_scale, (const float*) w.ffn_norm.data, h_, moe ? nullptr : q8_,
+                              moe, E, T, g.rms_eps, s, moe ? m_x_ : nullptr, moe ? mx_scratch_ : nullptr);
+        if (!moe) {
+            q8_0_mmvq(w.ffn_gate, q8_, g_, T, s);
+            q8_0_mmvq(w.ffn_up, q8_, u_, T, s);
             silu_mul(g_, u_, m_, T * g.n_ff_dense, s);
             q8_0_gemv(w.ffn_down, m_, q8_, y_, T, s);
         } else {
-            router_logits((const float*) w.gate_inp.data, h_, router_logits_, T, E, g.n_expert, s);
-            router_topk(router_logits_, (const float*) w.exp_probs_b.data, ids_, wt_, T, g.n_expert, K,
-                        g.expert_weights_scale, s);
-            resident_slots(ids_, d_res_ + (size_t) l * g.n_expert, slots_, T * K, s);
-            strata::kernels::doorbell_publish(h_, ids_, wt_, (int64_t) T * E, (int64_t) T * K, m_x_, m_ids_, m_w_,
-                                              m_seq_, s);
+            mimo_router_fused((const float*) w.gate_inp.data, (const float*) w.exp_probs_b.data, h_, router_logits_,
+                              ids_, wt_, T, E, g.n_expert, K, g.expert_weights_scale, d_res_ + (size_t) l * g.n_expert,
+                              slots_, m_ids_, m_w_, m_seq_, s);
             stamp(l, 1);
-            fill_zero(y_, T * E, s);
-            mxfp4_experts(slot_ptr_, slots_, wt_, h_, y_, T, K, mx_scratch_, s);
+            mxfp4_experts(slot_ptr_, slots_, wt_, nullptr, y_, T, K, mx_scratch_, s);   // x: in mx_scratch_
             stamp(l, 2);
             strata::kernels::wait_flag_ge(m_flag_, ++ring, s);
             stamp(l, 3);
-            strata::kernels::copy_from_mapped(cpu_out_, m_out_, (int64_t) T * E, s);
-            add_scaled(y_, cpu_out_, 1.f, E * T, s);
         }
-        add_scaled(x_, y_, 1.f, E * T, s);
+        const DevTensor& next_norm = l + 1 < g.n_layer ? model_.layer(l + 1).attn_norm : model_.output_norm();
+        mimo_add_rmsnorm_q8_1(x_, y_, moe ? m_out_ : nullptr, 1.f, (const float*) next_norm.data, h_, q8_, false, E, T,
+                              g.rms_eps, s);
         stamp(l, 4);
     }
-    mimo_rmsnorm(x_, (const float*) model_.output_norm().data, h_, E, T, g.rms_eps, s);
-    q8_0_gemv(model_.output(), h_, q8_, logits_, T, s);
+    q8_0_mmvq(model_.output(), q8_, logits_, T, s);
     argmax_rows(logits_, next_, T, g.n_vocab, s);
     if (!cuda_ok(cudaStreamEndCapture(s, &graph), "end capture", err)) return false;
     const cudaError_t st = cudaGraphInstantiate(&graphs_[T], graph, 0);
@@ -810,32 +819,35 @@ bool MimoDecoder::forward(const int32_t* tokens, int T, int pos0, int32_t* next,
         std::ofstream(cfg_.dump_dir + "/tokens.i32", std::ios::binary | std::ios::app).write((const char*) tokens, 4 * T);
     }
     embed_q8_0(model_.token_embd().data, tok_, x_, T, E, s);
+    // the graph's kernels (capture): norms with their q8_1, the end of a layer with the next layer's attn_norm
+    mimo_add_rmsnorm_q8_1(x_, nullptr, nullptr, 1.f, (const float*) model_.layer(0).attn_norm.data, h_, q8_, false, E,
+                          T, g.rms_eps, s);
     for (int l = 0; l < g.n_layer; ++l) {
         const LayerWeights& w = model_.layer(l);
         const AttnLayer& L = attn_[(size_t) l];
-        mimo_rmsnorm(x_, (const float*) w.attn_norm.data, h_, E, T, g.rms_eps, s);
         dump("attn_norm", l, h_, (size_t) E * 4, T);
-        q8_0_gemv(w.attn_qkv, h_, q8_, qkv_, T, s);
+        q8_0_mmvq(w.attn_qkv, q8_, qkv_, T, s);
         dump("wqkv", l, qkv_, (size_t) g.qkv_rows(l) * 4, T);
         mimo_qkv_rope_append(qkv_, pos0_, T, L, kv_[(size_t) l], q_, s);
         dump("Qcur", l, q_, (size_t) g.q_rows() * 4, T);
-        mimo_attn_decode(q_, pos0_, T, L, kv_[(size_t) l], attn_scratch_, a_, s);
-        q8_0_gemv(w.attn_output, a_, q8_, y_, T, s);
+        mimo_attn_decode(q_, pos0_, T, L, kv_[(size_t) l], attn_scratch_, a_, s, 0, q8_);
+        q8_0_mmvq(w.attn_output, q8_, y_, T, s);
         dump("attn_out", l, y_, (size_t) E * 4, T);
-        mimo_residual_add(x_, y_, g.value_scale, E * T, s);
+        mimo_add_rmsnorm_q8_1(x_, y_, nullptr, g.value_scale, (const float*) w.ffn_norm.data, h_,
+                              g.is_moe(l) ? nullptr : q8_, g.is_moe(l), E, T, g.rms_eps, s, nullptr,
+                              g.is_moe(l) ? mx_scratch_ : nullptr);
         dump("ffn_inp", l, x_, (size_t) E * 4, T);
-        mimo_rmsnorm(x_, (const float*) w.ffn_norm.data, h_, E, T, g.rms_eps, s);
         dump("ffn_norm", l, h_, (size_t) E * 4, T);
         if (!g.is_moe(l)) {
-            q8_0_gemv(w.ffn_gate, h_, q8_, g_, T, s);
-            q8_0_gemv(w.ffn_up, h_, q8_, u_, T, s);
+            q8_0_mmvq(w.ffn_gate, q8_, g_, T, s);
+            q8_0_mmvq(w.ffn_up, q8_, u_, T, s);
             silu_mul(g_, u_, m_, T * g.n_ff_dense, s);
             q8_0_gemv(w.ffn_down, m_, q8_, y_, T, s);
             dump("ffn_out", l, y_, (size_t) E * 4, T);
         } else {
-            router_logits((const float*) w.gate_inp.data, h_, router_logits_, T, E, g.n_expert, s);
-            router_topk(router_logits_, (const float*) w.exp_probs_b.data, ids_, wt_, T, g.n_expert, K,
-                        g.expert_weights_scale, s);
+            mimo_router_fused((const float*) w.gate_inp.data, (const float*) w.exp_probs_b.data, h_, router_logits_,
+                              ids_, wt_, T, E, g.n_expert, K, g.expert_weights_scale, nullptr, nullptr, nullptr,
+                              nullptr, nullptr, s);
             dump("ffn_moe_topk", l, ids_, (size_t) K * 4, T, true);
             if (cfg_.cpu_experts) {   // v1: GPU hits and CPU misses at the same time
                 cudaMemcpyAsync(ids_host_, ids_, sizeof(int32_t) * T * K, cudaMemcpyDeviceToHost, s);
@@ -851,8 +863,7 @@ bool MimoDecoder::forward(const int32_t* tokens, int T, int pos0, int32_t* next,
                     ids_host_[i] = slot >= 0 ? -1 : ids_host_[i];   // the CPU's share: the misses
                 }
                 cudaMemcpyAsync(slots_, slots, sizeof(int32_t) * T * K, cudaMemcpyHostToDevice, s);
-                cudaMemsetAsync(y_, 0, sizeof(float) * T * E, s);
-                mxfp4_experts(slot_ptr_, slots_, wt_, h_, y_, T, K, mx_scratch_, s);
+                mxfp4_experts(slot_ptr_, slots_, wt_, nullptr, y_, T, K, mx_scratch_, s);   // x, y_: by the norm
                 const auto c0 = std::chrono::steady_clock::now();
                 cpu_->run_layer(l, T, h_host_, K, ids_host_, wt_host_, cpu_out_host_);
                 stats_.cpu_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
@@ -860,7 +871,9 @@ bool MimoDecoder::forward(const int32_t* tokens, int T, int pos0, int32_t* next,
                 add_scaled(y_, cpu_out_, 1.f, E * T, s);
                 if (!cuda_ok(cudaStreamSynchronize(s), "experts", err)) return false;   // `slots` and the pinned rows
                 dump("ffn_moe_out", l, y_, (size_t) E * 4, T);
-                add_scaled(x_, y_, 1.f, E * T, s);
+                const DevTensor& next_norm = l + 1 < g.n_layer ? model_.layer(l + 1).attn_norm : model_.output_norm();
+                mimo_add_rmsnorm_q8_1(x_, y_, nullptr, 1.f, (const float*) next_norm.data, h_, q8_, false, E, T,
+                                      g.rms_eps, s);
                 dump("l_out", l, x_, (size_t) E * 4, T);
                 continue;
             }
@@ -893,17 +906,16 @@ bool MimoDecoder::forward(const int32_t* tokens, int T, int pos0, int32_t* next,
                 slots[i] = slot;
             }
             cudaMemcpyAsync(slots_, slots, sizeof(int32_t) * T * K, cudaMemcpyHostToDevice, s);
-            cudaMemsetAsync(y_, 0, sizeof(float) * T * E, s);
-            mxfp4_experts(slot_ptr_, slots_, wt_, h_, y_, T, K, mx_scratch_, s);
+            mxfp4_experts(slot_ptr_, slots_, wt_, nullptr, y_, T, K, mx_scratch_, s);
             if (!cuda_ok(cudaStreamSynchronize(s), "experts", err)) return false;   // `slots` is a stack array
             dump("ffn_moe_out", l, y_, (size_t) E * 4, T);
         }
-        add_scaled(x_, y_, 1.f, E * T, s);
+        const DevTensor& next_norm = l + 1 < g.n_layer ? model_.layer(l + 1).attn_norm : model_.output_norm();
+        mimo_add_rmsnorm_q8_1(x_, y_, nullptr, 1.f, (const float*) next_norm.data, h_, q8_, false, E, T, g.rms_eps, s);
         dump("l_out", l, x_, (size_t) E * 4, T);
     }
-    mimo_rmsnorm(x_, (const float*) model_.output_norm().data, h_, E, T, g.rms_eps, s);
     dump("result_norm", -1, h_, (size_t) E * 4, T);
-    q8_0_gemv(model_.output(), h_, q8_, logits_, T, s);
+    q8_0_mmvq(model_.output(), q8_, logits_, T, s);
     dump("result_output", -1, logits_, (size_t) g.n_vocab * 4, T);
     argmax_rows(logits_, next_, T, g.n_vocab, s);
     cudaMemcpyAsync(next, next_, sizeof(int32_t) * T, cudaMemcpyDeviceToHost, s);

@@ -427,7 +427,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
 
   # ---- MiMo-V2.6-Flash (docs/MIMO_PORT_PLAN.md) -------------------------------------------------------------
-  add_library(strata_mimo STATIC src/mimo/model.cpp src/mimo/router.cu src/mimo/ops.cu src/mimo/attn.cu src/mimo/decoder.cpp src/mimo/prefill.cpp
+  add_library(strata_mimo STATIC src/mimo/model.cpp src/mimo/router.cu src/mimo/ops.cu src/mimo/attn.cu src/mimo/fused.cu src/mimo/decoder.cpp src/mimo/prefill.cpp
                           src/mimo/cpu_experts.cpp)
   if(STRATA_ENABLE_CUDA)
     # step 3: the resident experts' MXFP4 kernels (CUDA only for now: inline PTX loads)
@@ -492,6 +492,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(mimo_attn_prompt_test PRIVATE strata_mimo)
     add_test(NAME mimo_attn_prompt_test COMMAND mimo_attn_prompt_test)
     set_tests_properties(mimo_attn_prompt_test PROPERTIES SKIP_RETURN_CODE 77)
+    # the decode window's fused kernels against the separate ones, bitwise (synthetic, no model)
+    add_executable(mimo_fused_test tests/cuda/mimo_fused_test.cpp)
+    target_link_libraries(mimo_fused_test PRIVATE strata_mimo)
+    add_test(NAME mimo_fused_test COMMAND mimo_fused_test)
+    set_tests_properties(mimo_fused_test PROPERTIES SKIP_RETURN_CODE 77)
   endif()
 
   if(STRATA_ENABLE_HIP)
