@@ -40,6 +40,7 @@ int main(int argc, char** argv) {
         else if (a == "--dump") cfg.dump_dir = argv[i + 1];
         else if (a == "--cpu-experts") cfg.cpu_experts = std::atoi(argv[i + 1]) != 0;
         else if (a == "--ram-copy") cfg.ram_copy = std::atoi(argv[i + 1]) != 0;
+        else if (a == "--graph") cfg.graph = std::atoi(argv[i + 1]) != 0;
         else {
             std::fprintf(stderr, "unknown option %s\n", a.c_str());
             return 2;

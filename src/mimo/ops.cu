@@ -32,6 +32,17 @@ __global__ void add_scaled_kernel(float* __restrict__ x, const float* __restrict
     if (i < n) x[i] += scale * y[i];
 }
 
+__global__ void fill_zero_kernel(float* __restrict__ x, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = 0.f;
+}
+
+__global__ void resident_slots_kernel(const int32_t* __restrict__ ids, const int32_t* __restrict__ res,
+                                      int32_t* __restrict__ slots, int n) {
+    const int i = threadIdx.x;
+    if (i < n) slots[i] = res[ids[i]];
+}
+
 constexpr int kArgmaxThreads = 1024;
 
 __global__ void argmax_kernel(const float* __restrict__ logits, int32_t* __restrict__ ids, int n_vocab) {
@@ -77,6 +88,12 @@ void silu_mul(const float* gate, const float* up, float* out, int n, cudaStream_
 
 void add_scaled(float* x, const float* y, float scale, int n, cudaStream_t s) {
     add_scaled_kernel<<<(n + 255) / 256, 256, 0, s>>>(x, y, scale, n);
+}
+
+void fill_zero(float* x, int n, cudaStream_t s) { fill_zero_kernel<<<(n + 255) / 256, 256, 0, s>>>(x, n); }
+
+void resident_slots(const int32_t* ids, const int32_t* res_layer, int32_t* slots, int n, cudaStream_t s) {
+    resident_slots_kernel<<<1, (n + 31) / 32 * 32, 0, s>>>(ids, res_layer, slots, n);
 }
 
 void argmax_rows(const float* logits, int32_t* ids, int T, int n_vocab, cudaStream_t s) {

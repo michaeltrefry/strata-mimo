@@ -34,6 +34,7 @@ struct DecoderConfig {
     std::string dump_dir;           // when set: every intermediate, named as llama.cpp names it, appended per window
     bool cpu_experts = true;        // non-resident experts on the CPU (v1); false: copied into GPU staging slots (v0)
     bool ram_copy = true;           // CPU experts read from a RAM copy of every MoE layer (else the GGUF mapping)
+    bool graph = true;              // v2: one CUDA graph per window size, the CPU handoff inside it (no dump)
 };
 
 struct DecoderStats {
@@ -61,6 +62,9 @@ public:
     int resident_experts() const { return n_resident_; }
 
 private:
+    bool forward_graph(int T, int pos0, int32_t* next, std::string& err);
+    bool capture(int T, std::string& err);
+    void release_gpu_waits();
     void dump(const char* name, int layer, const void* dev, size_t bytes_per_token, int T, bool is_int = false);
 
     MimoModel& model_;
@@ -91,6 +95,12 @@ private:
     int32_t* ids_host_ = nullptr;              // pinned
     float* cpu_out_ = nullptr;                 // device copy of the CPU's sums
     long long prev_affinity_ = -1;
+    // v2: the window graphs and the mapped handoff (host pointer h_*, device alias m_*)
+    cudaGraphExec_t graphs_[9] = {};
+    int32_t* d_res_ = nullptr;                 // [layer][expert] -> resident slot or -1, on the device
+    float *h_x_ = nullptr, *m_x_ = nullptr, *h_w_ = nullptr, *m_w_ = nullptr, *h_out_ = nullptr, *m_out_ = nullptr;
+    int32_t *h_ids_ = nullptr, *m_ids_ = nullptr;
+    uint32_t *h_seq_ = nullptr, *m_seq_ = nullptr, *h_flag_ = nullptr, *m_flag_ = nullptr;
 };
 
 }  // namespace strata::mimo

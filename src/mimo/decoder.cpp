@@ -1,6 +1,8 @@
 #include "strata/mimo/decoder.hpp"
 
 #include "strata/kernels/cpu/pool.hpp"
+#include "strata/kernels/elementwise.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/mimo/cpu_experts.hpp"
 #include "strata/mimo/expert_mxfp4.hpp"
@@ -10,6 +12,9 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
+#include <climits>
+#include <immintrin.h>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -60,7 +65,12 @@ bool read_profile(const std::string& path, int n_layer, int n_expert, std::vecto
 MimoDecoder::MimoDecoder(MimoModel& model, const DecoderConfig& cfg) : model_(model), cfg_(cfg) {}
 
 MimoDecoder::~MimoDecoder() {
+    release_gpu_waits();   // no spin kernel may outlive this object (Strata #267)
     if (stream_) cudaStreamSynchronize(stream_);
+    for (auto& ge : graphs_)
+        if (ge) cudaGraphExecDestroy(ge);
+    for (void* p : {(void*) h_x_, (void*) h_w_, (void*) h_out_, (void*) h_ids_, (void*) h_seq_, (void*) h_flag_})
+        if (p) cudaFreeHost(p);
     for (auto& kv : kv_) attn_kv_free(kv);
     attn_scratch_free(attn_scratch_);
     for (void* p : allocs_) cudaFree(p);
@@ -129,6 +139,23 @@ bool MimoDecoder::init(std::string& err) {
             !dev(act, &cpu_out_))
             return false;
     }
+    // v2: the mapped handoff between the window graph and the host loop
+    if (cfg_.cpu_experts && cfg_.graph) {
+        auto mapped = [&](size_t bytes, auto** h, auto** m) {
+            void* p = nullptr;
+            if (!cuda_ok(cudaHostAlloc(&p, bytes, cudaHostAllocMapped), "mapped memory", err)) return false;
+            std::memset(p, 0, bytes);
+            void* d = nullptr;
+            if (!cuda_ok(cudaHostGetDevicePointer(&d, p, 0), "mapped pointer", err)) return false;
+            *h = static_cast<std::remove_pointer_t<decltype(h)>>(p);
+            *m = static_cast<std::remove_pointer_t<decltype(m)>>(d);
+            return true;
+        };
+        const size_t act = (size_t) kMaxT * E * 4, small = (size_t) kMaxT * kRouterMaxUsed * 4;
+        if (!mapped(act, &h_x_, &m_x_) || !mapped(act, &h_out_, &m_out_) || !mapped(small, &h_w_, &m_w_) ||
+            !mapped(small, &h_ids_, &m_ids_) || !mapped(64, &h_seq_, &m_seq_) || !mapped(64, &h_flag_, &m_flag_))
+            return false;
+    }
     // staging slots (v0): one per (token, expert) a window can route
     n_staging_ = cfg_.cpu_experts ? 0 : kMaxT * g.n_expert_used;
     // resident slots: the profile's best experts, as many as the budget holds
@@ -175,7 +202,124 @@ bool MimoDecoder::init(std::string& err) {
         if (!cuda_ok(cudaStreamSynchronize(stream_), "expert relayout", err)) return false;
         resident_[(size_t) l][(size_t) e] = i;
     }
-    return true;
+    // the residency table on the device (v2 builds each layer's slot list there)
+    if (!dev(sizeof(int32_t) * (size_t) g.n_layer * g.n_expert, &d_res_)) return false;
+    std::vector<int32_t> flat;
+    for (const auto& r : resident_) flat.insert(flat.end(), r.begin(), r.end());
+    return cuda_ok(cudaMemcpy(d_res_, flat.data(), sizeof(int32_t) * flat.size(), cudaMemcpyHostToDevice), "residency", err);
+}
+
+void MimoDecoder::release_gpu_waits() {
+    if (h_flag_) {
+        *(volatile uint32_t*) h_flag_ = UINT32_MAX;   // past every ring: a waiting kernel returns
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        _mm_sfence();
+    }
+}
+
+// One window of T tokens, all 48 layers, as one graph: per MoE layer the router's picks go to the host through
+// doorbell_publish, the GPU runs its resident experts while the host loop runs the rest (forward_graph), and the
+// GPU waits for the host's flag before adding the CPU's sums.  Rings are 1..n_moe in layer order.
+bool MimoDecoder::capture(int T, std::string& err) {
+    const MimoGeometry& g = model_.geometry();
+    const int E = g.n_embd, K = g.n_expert_used;
+    cudaStream_t s = stream_;
+    cudaGraph_t graph = nullptr;
+    if (!cuda_ok(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal), "capture", err)) return false;
+    embed_q8_0(model_.token_embd().data, tok_, x_, T, E, s);
+    uint32_t ring = 0;
+    for (int l = 0; l < g.n_layer; ++l) {
+        const LayerWeights& w = model_.layer(l);
+        const AttnLayer& L = attn_[(size_t) l];
+        mimo_rmsnorm(x_, (const float*) w.attn_norm.data, h_, E, T, g.rms_eps, s);
+        q8_0_gemv(w.attn_qkv, h_, q8_, qkv_, T, s);
+        mimo_qkv_rope_append(qkv_, pos0_, T, L, kv_[(size_t) l], q_, s);
+        mimo_attn_decode(q_, pos0_, T, L, kv_[(size_t) l], attn_scratch_, a_, s);
+        q8_0_gemv(w.attn_output, a_, q8_, y_, T, s);
+        mimo_residual_add(x_, y_, g.value_scale, E * T, s);
+        mimo_rmsnorm(x_, (const float*) w.ffn_norm.data, h_, E, T, g.rms_eps, s);
+        if (!g.is_moe(l)) {
+            q8_0_gemv(w.ffn_gate, h_, q8_, g_, T, s);
+            q8_0_gemv(w.ffn_up, h_, q8_, u_, T, s);
+            silu_mul(g_, u_, m_, T * g.n_ff_dense, s);
+            q8_0_gemv(w.ffn_down, m_, q8_, y_, T, s);
+        } else {
+            router_logits((const float*) w.gate_inp.data, h_, router_logits_, T, E, g.n_expert, s);
+            router_topk(router_logits_, (const float*) w.exp_probs_b.data, ids_, wt_, T, g.n_expert, K,
+                        g.expert_weights_scale, s);
+            resident_slots(ids_, d_res_ + (size_t) l * g.n_expert, slots_, T * K, s);
+            strata::kernels::doorbell_publish(h_, ids_, wt_, (int64_t) T * E, (int64_t) T * K, m_x_, m_ids_, m_w_,
+                                              m_seq_, s);
+            fill_zero(y_, T * E, s);
+            mxfp4_experts(slot_ptr_, slots_, wt_, h_, y_, T, K, mx_scratch_, s);
+            strata::kernels::wait_flag_ge(m_flag_, ++ring, s);
+            strata::kernels::copy_from_mapped(cpu_out_, m_out_, (int64_t) T * E, s);
+            add_scaled(y_, cpu_out_, 1.f, E * T, s);
+        }
+        add_scaled(x_, y_, 1.f, E * T, s);
+    }
+    mimo_rmsnorm(x_, (const float*) model_.output_norm().data, h_, E, T, g.rms_eps, s);
+    q8_0_gemv(model_.output(), h_, q8_, logits_, T, s);
+    argmax_rows(logits_, next_, T, g.n_vocab, s);
+    if (!cuda_ok(cudaStreamEndCapture(s, &graph), "end capture", err)) return false;
+    const cudaError_t st = cudaGraphInstantiate(&graphs_[T], graph, 0);
+    cudaGraphDestroy(graph);
+    return cuda_ok(st, "graph instantiate", err);
+}
+
+bool MimoDecoder::forward_graph(int T, int pos0, int32_t* next, std::string& err) {
+    (void) pos0;   // already in pos0_ (forward wrote it)
+    const MimoGeometry& g = model_.geometry();
+    const int K = g.n_expert_used;
+    if (!graphs_[T] && !capture(T, err)) return false;
+    cudaStream_t s = stream_;
+    *(volatile uint32_t*) h_seq_ = 0;
+    *(volatile uint32_t*) h_flag_ = 0;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (!cuda_ok(cudaGraphLaunch(graphs_[T], s), "graph launch", err)) return false;
+    volatile uint32_t* const seq = h_seq_;
+    volatile uint32_t* const flag = h_flag_;
+    uint32_t ring = 0;
+    int32_t ids[kMaxT * kRouterMaxUsed];
+    for (int l = 0; l < g.n_layer; ++l) {
+        if (!g.is_moe(l)) continue;
+        const uint32_t want = ++ring;
+        const auto a = std::chrono::steady_clock::now();
+        uint32_t spins = 0;
+        while (*seq < want) {
+            _mm_pause();
+            if ((++spins & 4095u) != 0) continue;
+            const cudaError_t q = cudaStreamQuery(s);
+            if (q != cudaErrorNotReady && *seq < want) {
+                release_gpu_waits();
+                err = "layer " + std::to_string(l) + " never rang (" +
+                      std::string(q == cudaSuccess ? "graph finished" : cudaGetErrorString(q)) + ")";
+                return false;
+            }
+            if (std::chrono::steady_clock::now() - a > std::chrono::seconds(20)) {
+                release_gpu_waits();
+                cudaStreamSynchronize(s);
+                err = "timed out waiting for layer " + std::to_string(l);
+                return false;
+            }
+        }
+        std::atomic_thread_fence(std::memory_order_acquire);
+        for (int i = 0; i < T * K; ++i) {
+            const int e = ((volatile int32_t*) h_ids_)[i];
+            ++stats_.expert_uses;
+            const bool hit = resident_[(size_t) l][(size_t) e] >= 0;
+            stats_.expert_hits += hit;
+            ids[i] = hit ? -1 : e;
+        }
+        const auto c0 = std::chrono::steady_clock::now();
+        cpu_->run_layer(l, T, h_x_, K, ids, h_w_, h_out_);
+        stats_.cpu_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        _mm_sfence();
+        *flag = want;
+    }
+    cudaMemcpyAsync(next, next_, sizeof(int32_t) * T, cudaMemcpyDeviceToHost, s);
+    return cuda_ok(cudaStreamSynchronize(s), "window", err);
 }
 
 void MimoDecoder::dump(const char* name, int layer, const void* dev, size_t bytes_per_token, int T, bool is_int) {
@@ -199,6 +343,10 @@ bool MimoDecoder::forward(const int32_t* tokens, int T, int pos0, int32_t* next,
     cudaStream_t s = stream_;
     cudaMemcpyAsync(tok_, tokens, sizeof(int32_t) * T, cudaMemcpyHostToDevice, s);
     cudaMemcpyAsync(pos0_, &pos0, sizeof(int32_t), cudaMemcpyHostToDevice, s);
+    if (cfg_.graph && cfg_.cpu_experts && cfg_.dump_dir.empty() && !logits) {
+        if (!cuda_ok(cudaStreamSynchronize(s), "inputs", err)) return false;   // `tokens` / `pos0` live on the stack
+        return forward_graph(T, pos0, next, err);
+    }
     if (!cfg_.dump_dir.empty()) {
         cudaStreamSynchronize(s);
         std::ofstream(cfg_.dump_dir + "/tokens.i32", std::ios::binary | std::ios::app).write((const char*) tokens, 4 * T);
