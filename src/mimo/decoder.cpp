@@ -236,12 +236,13 @@ bool MimoDecoder::init(std::string& err) {
         std::memcpy(p + s.stride[0], s.matrix(1, e), s.stride[1]);
         std::memcpy(p + s.stride[0] + s.stride[1], s.matrix(2, e), s.stride[2]);
         if (!cuda_ok(cudaMemcpyAsync(raw_, pinned_, kMxSlotBytes, cudaMemcpyHostToDevice, stream_), "expert upload", err)) return false;
-        mxfp4_slot_relayout(raw_, (void*) slot_addr_[(size_t) i], stream_);
+        mxfp4_slot_relayout(raw_, (void*) slot_addr_[(size_t) (n_spare + i)], stream_);
         if (!cuda_ok(cudaStreamSynchronize(stream_), "expert relayout", err)) return false;
-        resident_[(size_t) l][(size_t) e] = i;
+        resident_[(size_t) l][(size_t) e] = n_spare + i;   // the spares first: the last slots are the least used
     }
+    if (pmoe_ && !prefill_place(err)) return false;   // the prompt buffers in the last (least used) slots
     // decode-time residency: the spare slots, a copy stream and its buffer, the recent counts
-    for (int i = 0; i < n_spare; ++i) spares_.push_back(n_resident_ + i);
+    for (int i = 0; i < n_spare; ++i) spares_.push_back(i);
     if (n_spare > 0 && !profile_score_.empty()) {
         if (!cuda_ok(cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking), "copy stream", err) ||
             !dev(kMxSlotBytes, &raw_copy_))
@@ -507,12 +508,12 @@ bool MimoDecoder::adapt_window(int T, std::string& err) {
         ++stats_.swapped;
     }
     // decay: half-life adapt_half_life tokens
-    recent_scale_ *= std::pow(0.5f, (float) T / cfg_.adapt_half_life);
+    if (T > 0) recent_scale_ *= std::pow(0.5f, (float) T / cfg_.adapt_half_life);
     if (recent_scale_ < 1e-12f) {   // fold the scale into the counts before it underflows
         for (float& v : recent_) v *= recent_scale_;
         recent_scale_ = 1.f;
     }
-    if (++windows_since_adapt_ < cfg_.adapt_interval || spares_.empty()) return true;
+    if (T == 0 || ++windows_since_adapt_ < cfg_.adapt_interval || spares_.empty()) return true;
     windows_since_adapt_ = 0;
     // scores of every MoE expert; the best non-resident ones that beat the worst resident ones by adapt_margin
     const float a = cfg_.adapt_recent_weight;
@@ -832,7 +833,7 @@ bool MimoDecoder::forward(const int32_t* tokens, int T, int pos0, int32_t* next,
                 } else if (auto it = staged.find(e); it != staged.end()) {
                     slot = it->second;
                 } else {
-                    slot = n_resident_ + (int) staged.size();
+                    slot = n_resident_ + (int) staged.size();   // v0 (no spares): staging after the resident slots
                     staged.emplace(e, slot);
                     ++stats_.staged;
                     const ExpertSlices& es = model_.experts(l);

@@ -303,7 +303,7 @@ PrefillMoe::~PrefillMoe() {
     delete[] arrived_;
     delete[] freed_;
     if (copy_) cudaStreamDestroy(copy_);
-    if (dev_) cudaFree(dev_);
+    if (dev_ && owns_) cudaFree(dev_);
     if (h_counts_) cudaFreeHost(h_counts_);
     if (h_plan_) cudaFreeHost(h_plan_);
     delete (mmq::Context*) mmq_;
@@ -340,12 +340,14 @@ bool PrefillMoe::init(std::string& err) {
     const Layout L(cfg_);
     size_t free_b = 0, total_b = 0;
     cudaMemGetInfo(&free_b, &total_b);
-    if (free_b < L.total + (256ull << 20)) {
+    if (!owns_) {
+        // init_external: dev_ was set by the caller
+    } else if (free_b < L.total + (256ull << 20)) {
         err = "prefill moe: needs " + std::to_string(L.total >> 20) + " MiB of VRAM, " + std::to_string(free_b >> 20) +
               " MiB free";
         return false;
     }
-    if (cudaMalloc(&dev_, L.total) != cudaSuccess) {
+    if (owns_ && cudaMalloc(&dev_, L.total) != cudaSuccess) {
         (void) cudaGetLastError();
         err = "prefill moe: cudaMalloc of " + std::to_string(L.total >> 20) + " MiB failed";
         return false;
@@ -384,6 +386,20 @@ bool PrefillMoe::init(std::string& err) {
     }
     return true;
 }
+
+bool PrefillMoe::init_external(void* mem, std::string& err) {
+    owns_ = false;
+    dev_ = (uint8_t*) mem;
+    return init(err);
+}
+
+size_t PrefillMoe::layout_bytes() const {
+    // the tile choice of init() for a VRAM budget is not repeated here: callers of init_external use the config's
+    // tile_rows as it is
+    return Layout(cfg_).total;
+}
+
+void PrefillMoe::refresh(cudaStream_t stream) { mmq::iota(iota_, cfg_.tile_rows, stream); }
 
 bool PrefillMoe::register_host(void* p, size_t bytes, std::string& err) {
     const cudaError_t e = cudaHostRegister(p, bytes, cudaHostRegisterPortable);

@@ -34,24 +34,20 @@ bool ok(cudaError_t st, const char* what, std::string& err) {
 }  // namespace
 
 // The prompt path's device memory, allocated in init() BEFORE the expert budget is taken.
+// The prompt path's objects and the SIZES of its buffers (init, before the expert budget).  The buffers themselves
+// are placed in borrowed expert slots by prefill_place() once the slots exist.
 bool MimoDecoder::prefill_alloc(std::string& err) {
     const MimoGeometry& g = model_.geometry();
     const size_t S = (size_t) cfg_.prefill_slice, P = (size_t) cfg_.prefill_tile, E = (size_t) g.n_embd;
     const size_t Q = (size_t) std::max(g.qkv_rows(0), g.qkv_rows(1)), F = (size_t) g.n_ff_dense;
     const size_t wmax = std::max({Q * E, F * E, E * (size_t) g.attn_out_in(), 2 * E * E});   // dequantized weights
-    auto dev = [&](size_t bytes, auto** out) {
-        void* p = nullptr;
-        if (!ok(cudaMalloc(&p, std::max<size_t>(bytes, 256)), "prompt buffers", err)) return false;
-        allocs_.push_back(p);
-        *out = static_cast<std::remove_pointer_t<decltype(out)>>(p);
-        return true;
-    };
-    if (!dev(S * E * 4, &pX_) || !dev(S * E * 4, &pHn_) || !dev(S * E * 4, &pY_) || !dev(S * 8 * 4, &pIds_) ||
-        !dev(S * 8 * 4, &pW_) || !dev(S * 4, &pTok_) || !dev(P * (size_t) g.n_expert * 4, &pLogits_) ||
-        !dev(P * F * 2, &p16_) || !dev(P * Q * 4, &pQkv_) || !dev(P * (size_t) g.q_rows() * 2, &pQ16_) ||
-        !dev(P * (size_t) g.attn_out_in() * 4, &pA_) || !dev(P * F * 4, &pG_) || !dev(P * F * 4, &pU_) ||
-        !dev(wmax * 2, &pW1_) || !dev(wmax * 2, &pW2_) || !dev(P * E * 4, &pE_))
-        return false;
+    pf_bufs_ = {{(void**) &pX_, S * E * 4}, {(void**) &pHn_, S * E * 4}, {(void**) &pY_, S * E * 4},
+                {(void**) &pIds_, S * 8 * 4}, {(void**) &pW_, S * 8 * 4}, {(void**) &pTok_, S * 4},
+                {(void**) &pLogits_, P * (size_t) g.n_expert * 4}, {(void**) &p16_, P * F * 2},
+                {(void**) &pQkv_, P * Q * 4}, {(void**) &pQ16_, P * (size_t) g.q_rows() * 2},
+                {(void**) &pA_, P * (size_t) g.attn_out_in() * 4}, {(void**) &pG_, P * F * 4},
+                {(void**) &pU_, P * F * 4}, {(void**) &pW1_, wmax * 2}, {(void**) &pW2_, wmax * 2},
+                {(void**) &pE_, P * E * 4}};
     if (!attn_prompt_scratch_alloc(aps_, (int) P, g.n_head_kv[1], g.n_swa, 0, err)) return false;
     gemm_ = std::make_unique<prefill::Gemm>();
     if (!gemm_->init(stream_, 1 << 20, err)) return false;
@@ -59,12 +55,126 @@ bool MimoDecoder::prefill_alloc(std::string& err) {
     mc.max_tokens = (int) S;
     mc.k = g.n_expert_used;
     pmoe_ = std::make_unique<PrefillMoe>(mc);
-    if (!pmoe_->init(err)) return false;
-    size_t free_b = 0, total_b = 0;
-    cudaMemGetInfo(&free_b, &total_b);
-    std::fprintf(stderr, "prompt path: slice %d, tile %d, experts' buffers %.2f GiB; %.2f GiB of VRAM free after it\n",
-                 cfg_.prefill_slice, cfg_.prefill_tile, pmoe_->device_bytes() / 1073741824.0, free_b / 1073741824.0);
+    pf_bufs_.push_back({nullptr, pmoe_->layout_bytes()});   // the experts' buffers (ptr null: init_external)
     return true;
+}
+
+// Places the prompt buffers in the last slot chunks (each buffer inside one chunk: slots are 64 to an allocation),
+// taking as few chunks from the end as fit them; the slots from the first of those chunks on are "borrowed".
+bool MimoDecoder::prefill_place(std::string& err) {
+    constexpr int kChunk = 64;
+    const int n_slots = (int) slot_addr_.size();
+    std::vector<PfBuf> bufs = pf_bufs_;
+    std::sort(bufs.begin(), bufs.end(), [](const PfBuf& x, const PfBuf& y) { return x.bytes > y.bytes; });
+    const int n_chunks = (n_slots + kChunk - 1) / kChunk;
+    for (int take = 1; take <= n_chunks; ++take) {
+        // chunks [n_chunks - take, n_chunks): free bytes per chunk, first fit, largest buffer first
+        std::vector<size_t> used((size_t) take, 0), cap((size_t) take);
+        for (int c = 0; c < take; ++c) {
+            const int c0 = (n_chunks - take + c) * kChunk;
+            cap[(size_t) c] = (size_t) (std::min(c0 + kChunk, n_slots) - c0) * kMxSlotBytes;
+        }
+        std::vector<std::pair<int, size_t>> where;   // (chunk, offset) per buffer
+        bool fits = true;
+        for (const PfBuf& b : bufs) {
+            const size_t bytes = (b.bytes + 255) / 256 * 256;
+            int c = 0;
+            while (c < take && used[(size_t) c] + bytes > cap[(size_t) c]) ++c;
+            if (c == take) { fits = false; break; }
+            where.emplace_back(c, used[(size_t) c]);
+            used[(size_t) c] += bytes;
+        }
+        if (!fits) continue;
+        borrow_lo_ = (n_chunks - take) * kChunk;
+        for (size_t i = 0; i < bufs.size(); ++i) {
+            const int c0 = (n_chunks - take + where[i].first) * kChunk;
+            uint8_t* p = (uint8_t*) slot_addr_[(size_t) c0] + where[i].second;
+            if (bufs[i].ptr) *bufs[i].ptr = p;
+            else if (!pmoe_->init_external(p, err)) return false;
+        }
+        size_t total = 0;
+        for (const PfBuf& b : pf_bufs_) total += b.bytes;
+        std::fprintf(stderr, "prompt path: slice %d, tile %d; its %.2f GiB of buffers borrow the last %d expert slots\n",
+                     cfg_.prefill_slice, cfg_.prefill_tile, total / 1073741824.0, n_slots - borrow_lo_);
+        return true;
+    }
+    err = "the prompt path's buffers do not fit in the expert slots (too little VRAM for experts)";
+    return false;
+}
+
+// Finished background copies become resident (wait: all of them, after the copy stream drains).
+void MimoDecoder::commit_swaps(bool wait) {
+    if (!copy_stream_ || in_flight_.empty()) return;
+    if (wait) cudaStreamSynchronize(copy_stream_);
+    std::string err;
+    windows_since_adapt_ = 0;
+    adapt_window(0, err);   // T = 0: commits only, no decay; the interval reset above keeps it from starting copies
+}
+
+// Before a batched prompt: the experts in the borrowed slots stop being resident (their slots hold the prompt's
+// buffers until refill_slots), and no background copy may still target them.
+bool MimoDecoder::borrow_slots(std::string& err) {
+    const MimoGeometry& g = model_.geometry();
+    commit_swaps(true);
+    for (int l = 0; l < g.n_layer; ++l)
+        for (int e = 0; e < g.n_expert; ++e)
+            if (resident_[(size_t) l][(size_t) e] >= borrow_lo_) resident_[(size_t) l][(size_t) e] = -1;
+    const size_t before = spares_.size();
+    spares_.erase(std::remove_if(spares_.begin(), spares_.end(), [&](int s) { return s >= borrow_lo_; }), spares_.end());
+    lost_spares_ = (int) (before - spares_.size());
+    std::vector<int32_t> flat;
+    for (const auto& r : resident_) flat.insert(flat.end(), r.begin(), r.end());
+    pmoe_->refresh(stream_);
+    return ok(cudaMemcpyAsync(d_res_, flat.data(), sizeof(int32_t) * flat.size(), cudaMemcpyHostToDevice, stream_),
+              "residency", err) && ok(cudaStreamSynchronize(stream_), "borrow", err);
+}
+
+// After a batched prompt: the borrowed slots get the best non-resident experts again (scores: the profile, blended
+// with the recent picks and, when given, the prompt's own), except the spares the range held, which stay empty.
+bool MimoDecoder::refill_slots(const std::vector<std::vector<uint32_t>>* counts, std::string& err) {
+    const MimoGeometry& g = model_.geometry();
+    const int ne = g.n_expert, n_slots = (int) slot_addr_.size();
+    std::vector<int> free_slots;
+    for (int s = borrow_lo_; s < n_slots; ++s) free_slots.push_back(s);
+    for (int i = 0; i < lost_spares_ && !free_slots.empty(); ++i) {
+        spares_.push_back(free_slots.back());
+        free_slots.pop_back();
+    }
+    lost_spares_ = 0;
+    std::vector<std::pair<float, int>> cand;
+    for (int l = 0; l < g.n_layer; ++l) {
+        if (!g.is_moe(l)) continue;
+        double tr = 0, tp = 0;
+        for (int e = 0; e < ne; ++e) {
+            if (!recent_.empty()) tr += recent_[(size_t) l * ne + e];
+            if (counts) tp += (*counts)[(size_t) l][(size_t) e];
+        }
+        for (int e = 0; e < ne; ++e) {
+            if (resident_[(size_t) l][(size_t) e] >= 0) continue;
+            float sc = profile_score_.empty() ? 0.f : profile_score_[(size_t) l * ne + e];
+            if (tr > 0) sc = 0.5f * sc + 0.5f * (float) (recent_[(size_t) l * ne + e] / tr);
+            if (counts && tp > 0) sc = (1.f - cfg_.adapt_weight) * sc + cfg_.adapt_weight * (float) ((*counts)[(size_t) l][(size_t) e] / tp);
+            cand.emplace_back(sc, l * ne + e);
+        }
+    }
+    const size_t n = std::min(free_slots.size(), cand.size());
+    std::partial_sort(cand.begin(), cand.begin() + (std::ptrdiff_t) n, cand.end(),
+                      [](const auto& x, const auto& y) { return x.first > y.first; });
+    cudaStream_t s = stream_;
+    for (size_t i = 0; i < n; ++i) {
+        const int l = cand[i].second / ne, e = cand[i].second % ne, slot = free_slots[i];
+        const ExpertSlices& src = cpu_ ? cpu_->source(l) : model_.experts(l);
+        uint8_t* raw = (uint8_t*) raw_;
+        cudaMemcpyAsync(raw, src.matrix(0, e), src.stride[0], cudaMemcpyHostToDevice, s);
+        cudaMemcpyAsync(raw + src.stride[0], src.matrix(1, e), src.stride[1], cudaMemcpyHostToDevice, s);
+        cudaMemcpyAsync(raw + src.stride[0] + src.stride[1], src.matrix(2, e), src.stride[2], cudaMemcpyHostToDevice, s);
+        mxfp4_slot_relayout(raw, (void*) slot_addr_[(size_t) slot], s);
+        resident_[(size_t) l][(size_t) e] = slot;
+    }
+    std::vector<int32_t> flat;
+    for (const auto& r : resident_) flat.insert(flat.end(), r.begin(), r.end());
+    return ok(cudaMemcpyAsync(d_res_, flat.data(), sizeof(int32_t) * flat.size(), cudaMemcpyHostToDevice, s),
+              "residency", err) && ok(cudaStreamSynchronize(s), "refill", err);
 }
 
 void MimoDecoder::gemm_q8(const DevTensor& w, uint16_t* scratch, bool dequant, const uint16_t* x16, float* y, int T) {
@@ -122,6 +232,7 @@ bool MimoDecoder::prompt_batched(const int32_t* tokens, int n, int pos0, const C
     cudaStream_t s = stream_;
     if (!cfg_.dump_dir.empty())
         std::ofstream(cfg_.dump_dir + "/tokens.i32", std::ios::binary | std::ios::app).write((const char*) tokens, 4 * (size_t) n);
+    if (borrow_lo_ >= 0 && !borrow_slots(err)) return false;
     std::vector<int32_t> res(g.n_expert);
     // the prompt's routing, for adapt_residency: picks per layer and expert
     const bool adapt = n >= cfg_.adapt_min_prompt && !profile_score_.empty();
@@ -233,6 +344,7 @@ bool MimoDecoder::prompt_batched(const int32_t* tokens, int n, int pos0, const C
         if (!ok(cudaStreamSynchronize(s), "prompt slice", err)) return false;
         done += S;
     }
+    if (borrow_lo_ >= 0 && !refill_slots(adapt ? &counts : nullptr, err)) return false;
     return adapt ? adapt_residency(counts, err) : true;
 }
 

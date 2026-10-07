@@ -84,6 +84,12 @@ public:
     /// than that plus 256 MiB (on Windows an allocation past the free VRAM lands in system memory instead of
     /// failing).  False with `err` on failure.
     bool init(std::string& err);
+    /// The same in caller-owned device memory of layout_bytes() (e.g. borrowed expert slots): not freed here, and
+    /// what init writes into it (the row index table) is written again by refresh() - call it before each use
+    /// when the memory was lent to something else in between.
+    bool init_external(void* mem, std::string& err);
+    size_t layout_bytes() const;
+    void refresh(cudaStream_t stream);
     /// VRAM of a configuration (with tile_rows as given), and of this object after init.
     static size_t device_bytes(const PrefillMoeConfig& cfg);
     size_t device_bytes() const { return dev_bytes_ ? dev_bytes_ : device_bytes(cfg_); }
@@ -103,6 +109,7 @@ public:
 private:
     PrefillMoeConfig cfg_;
     uint8_t* dev_ = nullptr;          // one allocation: the buffers below
+    bool owns_ = true;                // false: init_external's memory
     size_t dev_bytes_ = 0;
     uint8_t* staging_ = nullptr;      // [staging][13,369,344] raw experts
     uint8_t* gu_q8_ = nullptr;        // [max(group, group_ram)][4096 rows x 4096] Q8_0 gate|up

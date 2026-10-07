@@ -114,6 +114,10 @@ private:
     bool forward_graph(int T, int pos0, int32_t* next, std::string& err);
     // the batched prompt path (src/mimo/prefill.cpp)
     bool prefill_alloc(std::string& err);
+    bool prefill_place(std::string& err);
+    void commit_swaps(bool wait);
+    bool borrow_slots(std::string& err);
+    bool refill_slots(const std::vector<std::vector<uint32_t>>* counts, std::string& err);
     bool prompt_batched(const int32_t* tokens, int n, int pos0, const ChooseFn& choose, int32_t* first, int32_t* draft,
                         const std::function<void(int)>& progress, std::string& err);
     void gemm_q8(const DevTensor& w, uint16_t* scratch, bool dequant, const uint16_t* x16, float* y, int T);
@@ -207,6 +211,12 @@ private:
     float *pQkv_ = nullptr, *pA_ = nullptr, *pG_ = nullptr, *pU_ = nullptr, *pE_ = nullptr;        // [P][..]
     int32_t *pIds_ = nullptr, *pTok_ = nullptr;
     uint16_t *p16_ = nullptr, *pQ16_ = nullptr, *pW1_ = nullptr, *pW2_ = nullptr;                // FP16
+    // The prompt buffers live in the expert slots of the last slot chunks ("borrowed"): those slots hold resident
+    // experts between prompts, are emptied for a batched prompt, and are filled again after it.
+    struct PfBuf { void** ptr; size_t bytes; };
+    std::vector<PfBuf> pf_bufs_;
+    int borrow_lo_ = -1;                       // first borrowed slot (all slots from it on), -1 = not placed
+    int lost_spares_ = 0;                      // spare slots that were in the borrowed range during a prompt
     std::vector<double> prof_us_;              // accumulated [48 * 4] intervals
     int prof_windows_ = 0;
 };
