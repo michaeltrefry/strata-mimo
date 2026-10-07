@@ -1,5 +1,6 @@
 // src/kernels/cpu/expert_layout.cpp - plan v0.3 P6: the per-layer expert table.  See the header.
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/mxfp4_avx512.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -127,7 +128,17 @@ void native_quant_act(const NativeFmt&, const float*, void*) { std::abort(); }
 void native_quant_h(const NativeFmt&, const float*, void*) { std::abort(); }
 void native_gu_rows(const NativeFmt&, const uint8_t*, const void* const*, int, float* const*, int, int) { std::abort(); }
 void native_down_rows(const NativeFmt&, const uint8_t*, const void* const*, int, float* const*, int, int) { std::abort(); }
+void native_gu_rows_at(const NativeFmt&, const uint8_t*, const uint8_t*, const void* const*, int, float* const*, int, int) {
+    std::abort();
+}
+void native_down_rows_at(const NativeFmt&, const uint8_t*, const void* const*, int, float* const*, int, int) { std::abort(); }
+void native_quant_h_part(const NativeFmt&, const float*, int, int, void*) { std::abort(); }
+void native_set_mxfp4_512(int) {}
+bool native_mxfp4_512() { return false; }
 #endif
+
+// MiMo's MXFP4 kernel needs what the Q2_0 / IQ kernels need (F, BW, VL, VNNI, VBMI; every such CPU has DQ)
+bool mxfp4_512_ok() { return cpu_avx512_ok(); }
 
 bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err) {
     ExpertLayout L;

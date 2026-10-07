@@ -24,7 +24,7 @@ this fork gets a **new `src/mimo/` layer stack and driver** and keeps Strata's k
 | # | Step | New / changed | ~LOC |
 | --- | --- | --- | ---: |
 | 1 | Geometry from GGUF metadata (`mimo2.*`), GGUF-direct upload of the non-expert weights, `ExpertLayout` from tensor offsets, accept arch `mimo2` | `include/strata/mimo/geometry.hpp`, `src/mimo/model.cpp`, `gguf_reader.hpp` | 700 |
-| 2 | CPU experts at n_embd 4096 / n_ff 2048: runtime H/NE instead of constants, `kNativeActBytes` >= 4352, `kNativeHBytes` >= 2176 | `expert_source.cpp`, `pool.*`, `expert_layout.cpp`, `cpu/expert.hpp`, `native_expert.hpp` | 200 |
+| 2 | CPU experts at n_embd 4096 / n_ff 2048: runtime H/NE instead of constants, `kNativeActBytes` >= 4352, `kNativeHBytes` >= 2176. Done: [MIMO_CPU_EXPERTS.md](MIMO_CPU_EXPERTS.md), 126-151 GB/s from RAM | `expert_source.cpp`, `pool.*`, `expert_layout.cpp`, `cpu/expert.hpp`, `native_expert.hpp` | 200 |
 | 3 | GPU MXFP4 (type 39) in `iq_mmvq` / `native_expert_grouped`, ported from ggml-cuda `vec_dot_mxfp4_q8_1` | `iq_kernels.cu` + parity test | 400 |
 | 4 | Router: F32 GEMV, sigmoid, select on p + bias, top-8, weights = unbiased p normalized | `src/mimo/router.cu` | 300 |
 | 5 | Attention: Q8_0 qkv, NEOX rope on 64 of 192 dims (two bases), int8 KV (global: linear; SWA: ring of 128 + window), split-K flash decode with sinks, value scale 0.707 | `src/mimo/attn.cu` + NumPy reference test | 1,000 |

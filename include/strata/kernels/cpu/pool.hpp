@@ -63,6 +63,18 @@ struct ExpertJobMulti {
     const void* nact[MAXT] = {};
 };
 
+/// MiMo (docs/MIMO_PORT_PLAN.md step 2): one routed expert of a layer, its matrices given where they are (the GGUF
+/// mapping or a RAM copy: gate, up and down are three separate tensors there), with the tokens routed to it and
+/// their router weights.
+struct MoeExpert {
+    const uint8_t* gate = nullptr;   ///< row 0 of this expert's gate matrix (n_ff rows of n_embd)
+    const uint8_t* up = nullptr;     ///< row 0 of its up matrix
+    const uint8_t* down = nullptr;   ///< row 0 of its down matrix (n_embd rows of n_ff)
+    int nt = 0;                      ///< tokens routed to it (1..MAXT)
+    int tok[MAXT] = {};              ///< which tokens of the call
+    float w[MAXT] = {};              ///< their router weights
+};
+
 /// How worker threads are allocated across physical/logical CPU cores (#272).  `All` is the layout the pool has
 /// always used and the default; the hybrid-aware ones are opt-in (--pool-affinity auto|p-cores).
 enum class PoolAffinity {
@@ -155,6 +167,21 @@ public:
     /// Plan v0.3 P6: the same for a native pack's layer (ggml-cpu arithmetic, `nact` activations).
     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n);
     static constexpr int kMaxSplitMulti = 96;
+    /// MiMo step 2: one MoE layer's CPU experts in one call, the router weights applied here:
+    ///   out[t][0, n_embd) = sum over ex[e] and its tokens k with ex[e].tok[k] == t of  ex[e].w[k] * expert_e(act[t]).
+    /// `act[t]` is token t's activation in the layer's gate/up vec_dot_type (`native_quant_act`); `out[t]` is
+    /// overwritten (a token with no expert here gets zeros).  Two phases, so two barriers: gate/up rows (each task
+    /// quantizes the intermediate rows it computed, in whole blocks of `f.h_block`), then down rows, each task owning
+    /// a range of output rows for all tokens and summing every expert into it - no reduction pass, no atomics.
+    /// At most kMaxSplitMulti experts and MAXT tokens; experts are summed in `ex` order (deterministic).
+    void run_moe(const NativeFmt& f, const MoeExpert* ex, int n, const void* const* act, int n_tok, float* const* out);
+    /// run_moe's tuning knobs (bench and tests; defaults measured in docs/MIMO_CPU_EXPERTS.md): tasks per thread in
+    /// each phase, and whether the host waits for every worker to park before and after each phase (run_phase).
+    int moe_tasks_per_thread = 3;
+    bool moe_park_waits = true;
+    /// run_moe's accumulated ms per phase and expert bytes read.
+    double ms_moe_gu = 0, ms_moe_down = 0;
+    int64_t moe_bytes = 0;
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
     int64_t multi_bytes = 0;
@@ -192,7 +219,7 @@ public:
 private:
     void worker(int id);
     void drain(int id, ExpertScratch& scratch, uint32_t epoch);
-    void run_phase(int mode, int n_tasks);
+    void run_phase(int mode, int n_tasks, bool park_waits = true);
     /// Claim the next job of batch `epoch`, or -1 (that batch is exhausted, or it is not the current one).
     int claim(uint32_t epoch);
     /// Publish the batch whose description the caller has just written: reset `done`, then `head`, then the epoch.
@@ -259,12 +286,17 @@ private:
     int64_t mrows_ = 0;     // rows of the current multi phase across all its experts (n * FF, then n * H)
     int mtasks_ = 1;        // equal row ranges the phase is cut into
     struct SplitBufMulti {
-        alignas(64) float ff[MAXT][FF];
+        alignas(64) float ff[MAXT][kNativeMaxFF];   // Q2_0 packs use the first FF, native layers n_ff
         ActQ a2[MAXT];
         alignas(64) uint8_t hq[MAXT][kNativeHBytes];   // plan v0.3 P6: native down activations
     };
     const NativeFmt* nfmt_ = nullptr;
     std::vector<SplitBufMulti> split_multi_;
+    // run_moe state: mode 7 = gate/up rows + their quantization, 8 = down rows summed per output row
+    const MoeExpert* mex_ = nullptr;
+    const void* const* mact_ = nullptr;
+    float* const* mout_ = nullptr;
+    int mntok_ = 0;
     PoolAffinity affinity_ = PoolAffinity::All;
     CpuTopology topo_;
 };
