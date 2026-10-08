@@ -89,6 +89,17 @@ The expert profile: `data/mimo-coding-answers.prof`, made with `python tools/mim
 
 then `python serve/server.py --engine strata --config <that file> --host 127.0.0.1 --port 8080`.
 
+## Starting and stopping
+
+`start-mimo.bat [config]` (Linux: `./start-mimo.sh`) starts the server in its own window on the config's port (8096
+when it has none).  The config is the argument, else `STRATA_MIMO_CONFIG`, else setup's `strata-mimo-mxfp4.json` in
+the Strata folder, else `strata-mimo.json` there.  It is ready after about 90 s; Ctrl+C or closing the window stops
+it.
+
+`stop-mimo.bat` (`./stop-mimo.sh`) stops the server and its engine started from this folder, from wherever they were
+started, including an engine left running after its server was killed.  It is a hard stop: the learned expert profile
+keeps its last periodic save (every 10 minutes by default) rather than one at exit.
+
 ## Where things are
 
 - [MIMO_PORT_PLAN.md](MIMO_PORT_PLAN.md): the plan and its steps.
