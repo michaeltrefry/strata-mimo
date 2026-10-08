@@ -100,11 +100,34 @@ time (4.3-5.1 ms per token across these runs): the GPU now waits longer for the 
 unchanged: the same 512 tokens with and without MTP, and every tensor of a `--dump` run of the 311-token prompt is
 bitwise the same file (against llama.cpp: top-1 98.71%, KL mean 0.00261, as before).
 
+## Residency that follows the work
+
+The resident set starts from the profile and then moves (`src/mimo/decoder.cpp`, `adapt_*` in DecoderConfig):
+
+- After a prompt of 2,048+ tokens the profile is blended with the prompt's own expert counts (weight 0.5) and the
+  difference swapped in from the pinned RAM copy (873 experts in 297 ms after a 67,723-token prompt).
+- During generation: counts that halve every 256 tokens; up to 2 swaps per window into 8 spare slots, copied on a
+  second stream and committed between windows.  Swapping in bursts stalled the CPU handoff (-30%); a trickle does
+  not.
+- The batched prompt path's 2.29 GiB of buffers borrow the last 188 expert slots for the prompt, which are refilled
+  afterwards; the server saves what it learned (`expert_profile_save`) and starts from it next time.
+
+1,024 generated tokens with MTP at 128K context: short prompt 111.6 -> 124.2 tok/s, 68K code prompt 72.5 -> 114.9.
+
+## 250K context
+
+A 248,835-token prompt (code and docs): read in 111.3 s (2,236 tok/s), then 86.0 tok/s output, 85.6% resident, 84%
+of MTP drafts accepted; the answer was correct and detailed.
+
+## Tried and not kept
+
+- Q6_K attention weights (qkv, output; 0.8 GiB more experts resident; KL vs Q8_0 0.0035): with the same forced
+  token sequence at 68K (`strata-mimo-run --force`), Q8_0 121.7 / 124.0 tok/s and Q6_K 123.7 / 122.1 - within
+  noise, so Q8_0 stays.  Free-running runs differ by more (101-131) because the two models generate different text.
+- Two MTP heads (drafting 2 tokens): 117 vs 121 tok/s short, 97.5 vs 109.6 at 68K - opt-in only (`--mtp-heads 2`).
+- Raising the CPU pool threads' priority: no change.
+
 ## Next
 
-- Prompt processing: 188 tok/s comes from running the prompt through 8-token decode windows; long prompts (a
-  50K-token coding context would take over 4 minutes) need the batched prefill path (GEMM + MXFP4 MMQ).  Its MoE part
-  is done: [MIMO_PREFILL_MOE.md](MIMO_PREFILL_MOE.md) (layer-major over slices of up to 32K tokens: 3,061-8,107 tok/s
-  for the experts at S = 4K-32K; compute-bound from ~8K).
-- The server (serve/), setup, and an expert profile from the user's own sessions.
-- The CPU's slow layers and an adaptive expert cache (LRU measured at 92% vs 84-90% static).
+- An option to split the experts over two GPUs.
+- The CPU's slow layers (p99 333 us per layer).

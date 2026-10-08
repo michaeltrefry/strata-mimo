@@ -12,7 +12,8 @@ and 512 GB of DDR5-6400, Windows 11.
 | --- | ---: | ---: |
 | Output, short coding prompts | 117-125 tok/s | 33 tok/s |
 | Output after a 19K-token code prompt (through the API) | 86.6 tok/s | - |
-| Output after a 68K-token code prompt | 86.9 tok/s | - |
+| Output after a 68K-token code prompt | 108-115 tok/s | - |
+| Output after a 248,835-token prompt | 86.0 tok/s (prompt read in 111 s, 2,236 tok/s) | - |
 | Prompt reading | 3,300 tok/s (17,881 tokens in 5.5 s, 67,723 in 20.5 s) | 96-178 tok/s |
 | First token after a 19,457-token prompt (API) | 6.2 s | - |
 | Context | 256K (8-bit KV) | |
@@ -101,7 +102,6 @@ then `python serve/server.py --engine strata --config <that file> --host 127.0.0
 
 ## Not done yet
 
-- Residency that adapts DURING generation (today it follows the profile, and a long prompt's own routing).
 - The start-up time (~70 s, the pinned copy of the experts).
 - Setup's MiMo path was run here as far as `--dry-run`, the strata-mimo build and the tokenizer extraction (the
   tokenizer files equal the hand-made ones); a full install on a fresh PC is not yet done.
