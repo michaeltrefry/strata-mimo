@@ -91,7 +91,7 @@ then `python serve/server.py --engine strata --config <that file> --host 127.0.0
 
 ## Starting and stopping
 
-`start-mimo.bat [config]` (Linux: `./start-mimo.sh`) starts the server in its own window on the config's port (8096
+`start-mimo.bat [config]` (Linux: `./start-mimo.sh`) starts the server in its own window on the config's port (8095
 when it has none).  The config is the argument, else `STRATA_MIMO_CONFIG`, else setup's `strata-mimo-mxfp4.json` in
 the Strata folder, else `strata-mimo.json` there.  It is ready after about 90 s; Ctrl+C or closing the window stops
 it.
