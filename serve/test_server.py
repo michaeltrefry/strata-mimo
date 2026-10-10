@@ -2353,5 +2353,30 @@ class ThinkingNotOpenedByTheTemplate(unittest.TestCase):
         self.assertEqual(self.events(["hmm</think>Tokyo."], opened=True), [("reasoning", "hmm"), ("content", "Tokyo.")])
 
 
+class EffortOnAnOnOffTemplate(unittest.TestCase):
+    """A template with enable_thinking but no reasoning_effort (MiMo's): low turns thinking off, medium and high
+    leave it on; a template with levels (Qwen's) still gets the level."""
+
+    def template(self, source):
+        import tempfile
+        from serve.frontend import ChatTemplate
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "chat_template.jinja"
+            path.write_text(source, encoding="utf-8")
+            return ChatTemplate(path)
+
+    def test_levels_on_an_on_off_template(self):
+        from serve.frontend import effort_kwargs
+        t = self.template("{% if enable_thinking is false %}OFF{% else %}ON{% endif %}")
+        for effort, want in [("low", "OFF"), ("medium", "ON"), ("high", "ON"), ("none", "OFF"), ("", "ON")]:
+            with self.subTest(effort=effort):
+                self.assertEqual(t.render([], **effort_kwargs(effort)), want)
+        self.assertEqual(t.render([], reasoning_effort="low", enable_thinking=True), "ON")   # an explicit switch wins
+
+    def test_a_template_with_levels_keeps_them(self):
+        t = self.template("{{ reasoning_effort }}{% if enable_thinking is false %} OFF{% endif %}")
+        self.assertEqual(t.render([], reasoning_effort="low"), "low")
+
+
 if __name__ == "__main__":
     unittest.main()

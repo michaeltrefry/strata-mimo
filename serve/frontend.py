@@ -45,11 +45,22 @@ class ChatTemplate:
         env.globals["raise_exception"] = raise_exception
         self.source = Path(path).read_text(encoding="utf-8")
         self.template = env.from_string(self.source)
+        # a template with thinking on/off but no effort levels (MiMo's): low is off, medium and high are on
+        self.on_off = "enable_thinking" in self.source and "reasoning_effort" not in self.source
+
+    def adapt(self, kwargs: dict) -> dict:
+        """The request's template kwargs as this template understands them."""
+        if not self.on_off or "reasoning_effort" not in kwargs:
+            return kwargs
+        kwargs = dict(kwargs)
+        if kwargs.pop("reasoning_effort") == "low" and "enable_thinking" not in kwargs:
+            kwargs["enable_thinking"] = False
+        return kwargs
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
         return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
-                                    **kwargs)
+                                    **self.adapt(kwargs))
 
 
 # ------------------------------------------------------------------------------------------------ requests

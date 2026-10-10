@@ -1340,6 +1340,7 @@ class Service:
     def prepare(self, messages, tools, kwargs, max_new=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context."""
+        kwargs = self.template.adapt(kwargs)
         prompt = self.template.render(messages, tools=tools, **kwargs)
         ids = self.tok.encode(prompt, parse_special=True)
         self.embeddings.path = None
