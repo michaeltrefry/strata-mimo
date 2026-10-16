@@ -127,6 +127,82 @@ of MTP drafts accepted; the answer was correct and detailed.
 - Two MTP heads (drafting 2 tokens): 117 vs 121 tok/s short, 97.5 vs 109.6 at 68K - opt-in only (`--mtp-heads 2`).
 - Raising the CPU pool threads' priority: no change.
 
+## Two sequence slots
+
+Opt-in `strata-mimo --slots 2` allocates separate main/MTP KV and CUDA graph executables for each sequence. Model
+weights, expert RAM/cache, CPU pool, activation buffers, handoff buffers and prompt workspace stay shared. One
+scheduler thread alternates full MTP verify/accept/draft steps, so shared hidden rows are consumed before another
+sequence overwrites them. Graphs bind each slot's fixed KV addresses; resetting a slot does not replace its
+allocations. `strata-mimo-run` and the default server still use slot 0.
+
+The tagged protocol advertises `READY <context-per-slot> stop multiplex=1 slots=2`. GEN carries a unique increasing
+command id and a slot id before the existing arguments; STOP carries the command id. RESUME, PP, T, DONE and ERR
+carry the same command id. A slot is reusable only after its command's terminal response. Expert hit/use counters
+are accumulated around each request's own scheduled turns, not copied from the process-wide totals.
+
+Prompts use complete calls of at most `--prefill-quantum` tokens (default 2,048). While the peer is decoding, turns
+are capped at 8 prompt tokens; with the default `--batched-min 128` these use the decode-window path and do not
+borrow/refill expert slots. Bulk chunks resume after the peer finishes; each bulk call refills borrowed slots before
+yielding. Lowering the batched threshold can change that latency trade-off. On an intermediate chunk, the chooser
+returns the next **actual prompt token**,
+without sampling: MTP writes one position ahead and would otherwise cache a prediction at the chunk boundary.
+Only the final chunk samples the first generated token. Prompt routing counts accumulate across chunks and prompt
+adaptation runs at completion. Repeated borrow/refill is deliberately retained initially; its cost needs measurement.
+
+Prefix reuse is slot-local. With MTP it replays the token before the first unvalidated token as well: that main
+hidden row is needed to replace MTP's one-ahead entry at a divergent suffix or extension boundary. The two-slot
+scheduler also accounts for writes beyond the accepted session from speculation and MTP. If required
+sliding-window history is no longer in the ring, it reprocesses from position zero;
+replaying only a short suffix would itself need older keys that are no longer present. A fresh reset clears the
+small rings; a retained-prefix continuation does not clear the MTP history it still needs.
+
+`mimo_serve_test` checks the production scheduler against a CPU fake, without a model or GPU. The attention tests
+also compare two independent KV sets using shared scratch and slot-bound graph replay against the CPU reference.
+The model-required `mimo_decoder_slots_test` compares fixed-input logits and drafts between isolated and
+alternating calls, including divergent/extended/canceled prompt-prefix reuse. Its arguments are the main GGUF,
+MTP GGUF, optional expert profile, optional expert budget in GiB, and optional MTP head count (1 or 2). It reads CPU
+experts from the existing GGUF mapping rather than allocating a second pinned ~150 GiB copy for validation.
+Validated 2026-10-15 on GPU 1 of the same RTX PRO 6000 Blackwell Max-Q PC: synthetic attention/shared-scratch
+isolation passed both direct and captured-graph execution; fused kernels remained bitwise equal. The full-model
+slot harness passed graph off, graph on and batched prefill with MTP enabled, 1,024 positions per slot, a 64 GiB
+expert budget and mapped CPU experts. Controlled divergent/extended/canceled-prefix comparisons reported zero
+maximum absolute logit error and matching MTP drafts. Their retained and fresh references use identical main-model
+window widths, rather than conflating window-width numerical differences with cache isolation.
+
+These are correctness checks. Separate HTTP validation timings follow.
+
+### HTTP validation (2026-10-15)
+
+GPU 1 on the same RTX PRO 6000 Blackwell Max-Q / Threadripper 9960X / 512 GB Windows 11 PC, one MTP head,
+262,144 positions **per slot**, 64 GiB expert budget (5,132 resident experts), coding-answers profile and
+`--ram-copy 0`. The server reported 6,320,685,056 bytes of KV across the two slots. GPU 0's existing MiMo server
+remained loaded and also served work during this session; CPU/RAM were shared. These are single validation runs,
+not an uncontended benchmark or a prediction for the normal pinned-RAM/full-expert-budget configuration.
+
+| HTTP workload, 256 generated tokens per completed response | Wall time | Total output tok/s, including prompts |
+| --- | ---: | ---: |
+| Two streamed short coding requests; a third queued request disconnected before dispatch | 6.54 s | 78.3 |
+| One streamed and one collected short coding response | 5.91 s | 86.6 |
+| OpenAI-compatible and Anthropic-compatible streams together | 6.27 s | 81.7 |
+
+Both streams produced model text before either finished. Canceling an active stream left its peer producing its
+full response; disconnecting the queued third request removed it without dispatch. An additional client that never
+read its SSE response did not stop two ordinary 256-token requests from completing; closing it left both slots idle.
+
+A 47-token request already generating beside a newly arrived 6,228-token prompt exposed the scheduling trade-off:
+
+| Measurement | Bulk prompt turns capped at 2,048 | 8-token prompt turns while peer generates |
+| --- | ---: | ---: |
+| Existing stream finishes | 28.02 s | 14.78 s |
+| Largest gap between its streamed text chunks | 8.467 s | 0.143 s |
+| Long prompt's first visible text | 21.35 s | 29.74 s |
+
+The interactive policy is retained: protect the live response, accepting slower prompt reading while the two share
+compute. After the peer completes, prefill returns to the configured bulk ceiling. These chunk-gap measurements are
+not a fixed latency guarantee. `tools/mimo/serve_slots_smoke.py --base-url <loopback test server> --case all` repeats
+the streamed/collected, cancellation, long-prompt and queue checks against an already-loaded two-slot instance; it
+never starts/stops a model or changes the launch configuration.
+
 ## Next
 
 - An option to split the experts over two GPUs.

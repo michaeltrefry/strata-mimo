@@ -4,7 +4,8 @@
     python -m serve.server --engine strata --config strata.json --port 8080   (the real engine, resident)
 
 Endpoints: POST /v1/chat/completions (OpenAI, stream and non-stream), POST /v1/messages (Anthropic, stream and
-non-stream), GET /v1/models, GET /models, GET /props, GET /slots, GET /health, GET /mcp. One sequence at a time behind a FIFO (plan: one resident sequence).
+non-stream), GET /v1/models, GET /models, GET /props, GET /slots, GET /health, GET /mcp.
+One sequence behind a FIFO by default; MiMo can opt into two resident cooperative slots.
 Tools from MCP servers (serve/mcp.py, `"mcp_servers"` in the config or --mcp-config) are offered only to requests that
 ask for them with `"strata_mcp": true` - the web app does; other clients see exactly the API they always saw.
 Images (optional, when the config has a "vision" entry): OpenAI image_url parts and Anthropic image blocks (base64
@@ -22,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
 import base64
 import hashlib
 import hmac
@@ -648,6 +650,17 @@ class StrataEngine:
                 self.progress, self.last = None, {}
 
 
+from serve.mimo_transport import MultiplexEngine
+
+
+class MiMoEngine(MultiplexEngine, StrataEngine):
+    """Opt-in tagged MiMo engine. The legacy StrataEngine path is unchanged."""
+    failure_type = EngineDied
+    silent_type = EngineSilent
+    stuck_type = EngineStuck
+    _parse_done_into = staticmethod(StrataEngine._parse_done)
+
+
 class Vision:
     """The resident image encoder: `strata-vision` (llama.cpp mtmd + the mmproj file) reads `ENC <image> <out>`
     lines and writes each image's embeddings; results are cached by the image's hash, so a conversation that
@@ -787,6 +800,42 @@ def engine_silence_s(cfg: dict) -> float:
     if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
         raise ValueError(f'"engine_silence_s" must be a number of seconds >= 0 (0 = no limit), not {v!r}')
     return float(v)
+
+
+def resolve_slots(cfg: dict, cli=None) -> int:
+    """Capacity is explicit, not truthy/coerced (bool, float and string config values are errors)."""
+    value = cfg.get("slots", 1) if cli is None else cli
+    if type(value) is not int or value not in (1, 2):
+        raise ValueError(f"slots={value!r}: expected integer 1 or 2")
+    return value
+
+
+def slot_engine_args(cfg: dict, slots: int) -> list[str]:
+    args = engine_args(cfg)
+    # One authoritative capacity setting; never let a hidden native arg contradict Service admission.
+    found = []
+    clean = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--slots":
+            if i + 1 >= len(args):
+                raise ValueError("--slots in engine args requires a value")
+            found.append(args[i + 1])
+            i += 2
+        elif arg.startswith("--slots="):
+            found.append(arg.split("=", 1)[1])
+            i += 1
+        else:
+            clean.append(arg)
+            i += 1
+    if any(v != str(slots) for v in found):
+        raise ValueError("engine --slots disagrees with server slots; set slots in the server config/CLI")
+    if slots == 2:
+        if cfg.get("family") != "mimo":
+            raise ValueError("slots=2 is supported only for the MiMo engine (family=mimo)")
+        clean += ["--slots", "2"]
+    return clean
 
 
 def engine_args(cfg: dict) -> list[str]:
@@ -955,7 +1004,15 @@ class Service:
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
-        self.fifo = threading.Lock()
+        self.fifo = threading.Lock()             # legacy FIFO, and multi-slot lifecycle exclusion only
+        self.capacity = getattr(engine, "capacity", 1)
+        self._request_local = threading.local()
+        self._slot_cv = threading.Condition()
+        self._free_slots = list(range(self.capacity))
+        self.max_queued_requests = 32                  # two-slot admission is bounded as well as token buffering
+        self._active_slots = {}
+        self._slot_rates = {}
+        self._slot_prefixes = {}                       # affinity hints only; native validates actual KV reuse
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
         # #321: browser pages of these origins may call /v1/* (CORS; "*" = any page - only with an api_key that
@@ -995,6 +1052,39 @@ class Service:
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
+
+    @property
+    def status(self):
+        return getattr(self._request_local, "status", self._status)
+
+    @status.setter
+    def status(self, value):
+        self._status = value
+
+    @property
+    def rate(self):
+        return getattr(self._request_local, "rate", self._rate)
+
+    @rate.setter
+    def rate(self, value):
+        self._rate = value
+
+    def slot_snapshot(self):
+        progress = self.engine.slot_progress() if hasattr(self.engine, "slot_progress") else {}
+        with self.status_lock:
+            return [{"id": i, "is_processing": i in self._active_slots,
+                     **dict(self._active_slots.get(i, {})), **progress.get(i, {})}
+                    for i in range(self.capacity)]
+
+    def _refresh_activity(self):
+        # Caller holds status_lock. Keep the legacy summary shape, but never share a live
+        # request dictionary with its peer. Detailed per-slot state lives in slot_snapshot().
+        active = list(self._active_slots.values())
+        queued = self._status.get("queued", 0)
+        self._status.clear()
+        if active:
+            self._status.update(active[0])
+        self._status.update(busy=bool(active), active=len(active), queued=queued)
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
@@ -1132,7 +1222,7 @@ class Service:
             if not self.engine.alive():
                 return "not loaded"
             with self.status_lock:
-                if self.status.get("busy") or self.status.get("queued"):
+                if self.status.get("busy") or self.status.get("queued") or self._active_slots:
                     return "busy"
             if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
                 return "busy"
@@ -1207,6 +1297,20 @@ class Service:
     def _tok_s(self):
         """tok/s over the last RATE_WINDOW_S seconds.  Returns 0.0 while nothing is generating."""
         with self.status_lock:
+            if self.capacity > 1 and not hasattr(self._request_local, "status"):
+                now = time.time()
+                total = 0.0
+                for slot, state in self._active_slots.items():
+                    if not state.get("first_token"):
+                        continue
+                    samples = list(self._slot_rates.get(slot, []))
+                    newest = samples[-1] if samples else None
+                    oldest = next(((t, g) for t, g in samples if now - t <= RATE_WINDOW_S), None)
+                    if newest and oldest and newest[0] - oldest[0] >= RATE_MIN_SPAN_S:
+                        total += max(0.0, (newest[1] - oldest[1]) / (newest[0] - oldest[0]))
+                    else:
+                        total += state.get("generated", 0) / max(RATE_MIN_SPAN_S, now - state["first_token"])
+                return total
             s = dict(self.status)
             rate = list(self.rate)
         if not s.get("busy") or not s.get("first_token"):
@@ -1221,6 +1325,10 @@ class Service:
     def _tok_s_mean(self):
         """The whole-request mean since the first token (the old formula), kept so the two can be compared."""
         with self.status_lock:
+            if self.capacity > 1 and not hasattr(self._request_local, "status"):
+                now = time.time()
+                return sum(s.get("generated", 0) / max(1e-6, now - s["first_token"])
+                           for s in self._active_slots.values() if s.get("first_token"))
             s = dict(self.status)
         if not s.get("busy") or not s.get("first_token"):
             return 0.0
@@ -1228,6 +1336,9 @@ class Service:
 
     def _prefill_tok_s_mean(self):
         """Engine-reported mean over newly read tokens, excluding the cached prefix."""
+        if self.capacity > 1 and not hasattr(self._request_local, "status"):
+            return sum(s.get("prefill_tok_s_mean") or 0.0 for s in self.slot_snapshot()
+                       if s.get("is_processing") and not s.get("first_token"))
         with self.status_lock:
             reading = self.status.get("busy") and self.status.get("first_token") is None
         return getattr(self.engine, "prefill_tok_s_mean", None) if reading else 0.0
@@ -1291,6 +1402,13 @@ class Service:
                 "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None}
         if state == "reading" and progress:
             live["prompt_read"], live["prompt_total"] = progress
+        if self.capacity > 1:
+            live["slots"] = self.slot_snapshot()
+            live["active"] = s.get("active", 0)
+            live["prefill_tok_s_mean"] = self._prefill_tok_s_mean()
+            if any(slot.get("first_token") for slot in live["slots"]):
+                live.update(state="generating", tok_s=round(self._tok_s(), 1),
+                            tok_s_mean=round(self._tok_s_mean(), 1), tok_s_window_s=RATE_WINDOW_S)
         engine = {"model": self.model, "max_context": self.engine.max_context, "images": self.vision is not None,
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
@@ -1323,10 +1441,11 @@ class Service:
             "started": int(self.started_at), "uptime_s": int(time.time() - self.started_at),
             "cache_max_tokens": ctx,
             "context": {"native": ctx, "max_positions": ctx},
-            "concurrency": {"serving": 1, "requested": 1},       # one request at a time; more wait their turn
+            "concurrency": {"serving": self.capacity, "requested": self.capacity},
             "dialects": ["/v1/chat/completions", "/v1/messages"],
             "vision": {"enabled": images, "available": images, "error": None},
-            "activity": {"requests": totals["requests"] + int(busy), "in_flight": int(busy) + int(s.get("queued") or 0),
+            "activity": {"requests": totals["requests"] + int(s.get("active", busy)),
+                         "in_flight": int(s.get("active", busy)) + int(s.get("queued") or 0),
                          "last_request_at": int(last_at) if last_at else None},
             "last_timings": last_t,
             "machine": {
@@ -1346,6 +1465,8 @@ class Service:
         self.embeddings.path = None
         images = images_of(messages)
         if images:
+            if self.capacity > 1:
+                raise ValueError("two-slot MiMo is text-only; images/GENI are unsupported")
             if self.vision is None:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
                                  "'vision'), so it cannot read images")
@@ -1412,6 +1533,8 @@ class Service:
                 elif ev.kind == "tool_call":
                     s["phase"] = "tool call complete"
                 s["tail"] = ((s.get("tail") or "") + (ev.text or ""))[-600:]
+            if self.capacity > 1:
+                self._refresh_activity()
 
     def _progress(self, last_print, every=1.0):
         """A progress line in the server window every `every` seconds while a request runs."""
@@ -1432,6 +1555,102 @@ class Service:
         return now
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel) -> Iterator[tuple[str, object]]:
+        if self.capacity == 1:
+            yield from self._run(ids, thinking, tools, max_new, sampling, cancel)
+            return
+        slot = None
+        state = None
+        queued = True
+        released = False
+        release_lock = threading.Lock()
+
+        def release():
+            nonlocal released
+            with release_lock:
+                if released or slot is None:
+                    return
+                released = True
+                with self.status_lock:
+                    if self._active_slots.get(slot) is state:
+                        self._active_slots.pop(slot, None)
+                        self._slot_rates.pop(slot, None)
+                    self._refresh_activity()
+                with self._slot_cv:
+                    self._free_slots.append(slot)
+                    self._slot_cv.notify_all()
+
+        waiting = time.perf_counter()
+        trace = getattr(self.request_trace, "record", None)
+        with self.status_lock:
+            if self._status.get("queued", 0) >= self.max_queued_requests:
+                raise ValueError("MiMo request queue is full; try again after an active request finishes")
+            self._status["queued"] += 1
+        last_ping = time.monotonic()
+        try:
+            while slot is None and not cancel.is_set():
+                with self._slot_cv:
+                    if self._free_slots:
+                        def shared_prefix(candidate):
+                            cached = self._slot_prefixes.get(candidate, ())
+                            count = 0
+                            for old, new in zip(cached, ids):
+                                if old != new:
+                                    break
+                                count += 1
+                            return count
+                        slot = max(self._free_slots, key=shared_prefix)
+                        self._free_slots.remove(slot)
+                        self._slot_prefixes[slot] = tuple(ids)
+                    else:
+                        self._slot_cv.wait(0.1)
+                if slot is None and time.monotonic() - last_ping >= 10:
+                    last_ping = time.monotonic()
+                    yield "ping", None
+            if slot is None or cancel.is_set():
+                yield "done", {"finish": "cancel", "completion_tokens": 0, "reused": 0, "timings": None}
+                return
+            # Lifecycle exclusion is short during normal serving, long only during one load/restart.
+            # Cancel a queued request without ever submitting GEN, including while another thread loads.
+            while not self.fifo.acquire(timeout=0.1):
+                if cancel.is_set():
+                    yield "done", {"finish": "cancel", "completion_tokens": 0, "reused": 0, "timings": None}
+                    return
+                if time.monotonic() - last_ping >= 10:
+                    last_ping = time.monotonic()
+                    yield "ping", None
+            try:
+                if cancel.is_set():
+                    return
+                self.ensure_loaded()
+                state = {"busy": False, "queued": 0, "slot": slot, "started": time.time(),
+                         "phase": "reading the prompt", "prompt_tokens": len(ids), "generated": 0,
+                         "first_token": None, "max_tokens": max_new}
+                self._request_local.status = state
+                self._request_local.rate = collections.deque(maxlen=32)
+                with self.status_lock:
+                    self._active_slots[slot] = state
+                    self._slot_rates[slot] = self._request_local.rate
+                    self._status["queued"] -= 1
+                    queued = False
+                    if trace is not None:
+                        trace["queue_s"] += round(time.perf_counter() - waiting, 3)
+                    self._refresh_activity()
+            finally:
+                self.fifo.release()
+            with self.engine.bind_slot(slot, on_failure=release):
+                gen = self._run(ids, thinking, tools, max_new, sampling, cancel)
+                try:
+                    yield from gen
+                finally:
+                    gen.close()
+        finally:
+            with self.status_lock:
+                if queued:
+                    self._status["queued"] -= 1
+            release()
+            self._request_local.__dict__.clear()
+
+    def _run(self, ids, thinking, tools, max_new, sampling, cancel) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..})."""
         budget = self.reasoning_budget(sampling) if thinking else None   # #123: opt-in, off by default
         defaults = {**self.sampling_defaults, **self.shared}   # the config's, then the Chat settings shared with apps
@@ -1455,7 +1674,7 @@ class Service:
         with self.status_lock:
             self.status["queued"] += 1
         try:
-            with self.fifo:
+            with self.fifo if self.capacity == 1 else contextlib.nullcontext():
                 try:
                     with self.status_lock:
                         if trace is not None:
@@ -1463,13 +1682,16 @@ class Service:
                             trace["state"] = "generating"
                         self.status["queued"] -= 1
                     # issue #27: it died in an earlier request (or was unloaded) - start it again instead of failing
-                    self.ensure_loaded()
+                    if self.capacity == 1:
+                        self.ensure_loaded()
                     with self.status_lock:
                         self.status.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
                                            generated=0, started=time.time(), first_token=None, tool=None, tail="",
                                            max_tokens=max_new)
                         self.last_request_at = time.time()
                         self.rate.clear()               # the previous request's samples must not leak into this one
+                        if self.capacity > 1:
+                            self._refresh_activity()
                     before = getattr(self.engine, "last", None)
                     last_print = time.time()
                     prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
@@ -1680,25 +1902,26 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
     messages = list(messages)
     while True:
         text, reasoning, calls, own_calls = [], [], [], 0
-        for kind, x in svc.run(ids, thinking, tools, max_new, sampling, cancel):
-            if kind == "done":
-                done = x
-                continue
-            if kind == "event":
-                ev: Event = x
-                if ev.call is not None and ev.call.name in mcp_names:
-                    if ev.kind == "tool_start":          # the model has started writing a call: say so at once
-                        yield "mcp", {"event": "start", "id": ev.call.id, "name": ev.call.name}
-                    elif ev.kind == "tool_call":
-                        calls.append(ev.call)
-                    continue                             # its argument pieces are not streamed to the client
-                if ev.kind == "tool_call":
-                    own_calls += 1
-                elif ev.kind == "content":
-                    text.append(ev.text)
-                elif ev.kind == "reasoning":
-                    reasoning.append(ev.text)
-            yield kind, x
+        with contextlib.closing(svc.run(ids, thinking, tools, max_new, sampling, cancel)) as source:
+            for kind, x in source:
+                if kind == "done":
+                    done = x
+                    continue
+                if kind == "event":
+                    ev: Event = x
+                    if ev.call is not None and ev.call.name in mcp_names:
+                        if ev.kind == "tool_start":          # the model has started writing a call: say so at once
+                            yield "mcp", {"event": "start", "id": ev.call.id, "name": ev.call.name}
+                        elif ev.kind == "tool_call":
+                            calls.append(ev.call)
+                        continue                             # its argument pieces are not streamed to the client
+                    if ev.kind == "tool_call":
+                        own_calls += 1
+                    elif ev.kind == "content":
+                        text.append(ev.text)
+                    elif ev.kind == "reasoning":
+                        reasoning.append(ev.text)
+                yield kind, x
         total += done["completion_tokens"]
         run_them = calls and not own_calls and done["finish"] == "stop" and not cancel.is_set()
         if run_them and rounds >= max_rounds:
@@ -1767,46 +1990,47 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
     calls = 0
     streamed = {}                                  # tool call id -> index, for calls sent piece by piece
     finished = set()                               # ... and the ones whose final tool_call came (#211)
-    for kind, x in run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel):
-        if kind == "ping":
-            yield None
-        elif kind == "mcp":
-            c = chunk({})
-            c["strata_mcp"] = x
-            yield c
-        elif kind == "event":
-            ev: Event = x
-            if ev.kind == "reasoning" and ev.text:
-                yield chunk({"reasoning_content": ev.text})
-            elif ev.kind == "content" and ev.text:
-                yield chunk({"content": ev.text})
-            elif ev.kind == "tool_start":
-                streamed[ev.call.id] = calls
-                calls += 1
-                yield chunk({"tool_calls": [{"index": streamed[ev.call.id], "id": ev.call.id, "type": "function",
-                                             "function": {"name": ev.call.name, "arguments": ""}}]})
-            elif ev.kind == "tool_args":
-                yield chunk({"tool_calls": [{"index": streamed[ev.call.id], "function": {"arguments": ev.text}}]})
-            elif ev.kind == "tool_call" and ev.call.id in streamed:
-                finished.add(ev.call.id)
-            elif ev.kind == "tool_call":
-                yield chunk({"tool_calls": [{"index": calls, "id": ev.call.id, "type": "function",
-                                             "function": {"name": ev.call.name,
-                                                          "arguments": json.dumps(ev.call.arguments, ensure_ascii=False)}}]})
-                calls += 1
-        else:
-            # a streamed call without its final tool_call is one the output ended inside: not "tool_calls" (#211)
-            whole = calls and streamed.keys() <= finished
-            finish = "tool_calls" if whole and x["finish"] == "stop" else {"cancel": "stop"}.get(x["finish"], x["finish"])
-            last = chunk({}, finish)
-            pt = x.get("prompt_tokens", len(ids))     # after MCP rounds: the last round's prompt
-            last["usage"] = {"prompt_tokens": pt, "completion_tokens": x["completion_tokens"],
-                             "total_tokens": pt + x["completion_tokens"],
-                             # the part of the prompt the conversation cache already held (OpenAI's field)
-                             "prompt_tokens_details": {"cached_tokens": x.get("reused") or 0}}
-            if x.get("timings"):
-                last["timings"] = x["timings"]          # llama.cpp's field: the speed its clients show
-            yield last
+    with contextlib.closing(run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel)) as source:
+        for kind, x in source:
+            if kind == "ping":
+                yield None
+            elif kind == "mcp":
+                c = chunk({})
+                c["strata_mcp"] = x
+                yield c
+            elif kind == "event":
+                ev: Event = x
+                if ev.kind == "reasoning" and ev.text:
+                    yield chunk({"reasoning_content": ev.text})
+                elif ev.kind == "content" and ev.text:
+                    yield chunk({"content": ev.text})
+                elif ev.kind == "tool_start":
+                    streamed[ev.call.id] = calls
+                    calls += 1
+                    yield chunk({"tool_calls": [{"index": streamed[ev.call.id], "id": ev.call.id, "type": "function",
+                                                 "function": {"name": ev.call.name, "arguments": ""}}]})
+                elif ev.kind == "tool_args":
+                    yield chunk({"tool_calls": [{"index": streamed[ev.call.id], "function": {"arguments": ev.text}}]})
+                elif ev.kind == "tool_call" and ev.call.id in streamed:
+                    finished.add(ev.call.id)
+                elif ev.kind == "tool_call":
+                    yield chunk({"tool_calls": [{"index": calls, "id": ev.call.id, "type": "function",
+                                                 "function": {"name": ev.call.name,
+                                                              "arguments": json.dumps(ev.call.arguments, ensure_ascii=False)}}]})
+                    calls += 1
+            else:
+                # a streamed call without its final tool_call is one the output ended inside: not "tool_calls" (#211)
+                whole = calls and streamed.keys() <= finished
+                finish = "tool_calls" if whole and x["finish"] == "stop" else {"cancel": "stop"}.get(x["finish"], x["finish"])
+                last = chunk({}, finish)
+                pt = x.get("prompt_tokens", len(ids))     # after MCP rounds: the last round's prompt
+                last["usage"] = {"prompt_tokens": pt, "completion_tokens": x["completion_tokens"],
+                                 "total_tokens": pt + x["completion_tokens"],
+                                 # the part of the prompt the conversation cache already held (OpenAI's field)
+                                 "prompt_tokens_details": {"cached_tokens": x.get("reused") or 0}}
+                if x.get("timings"):
+                    last["timings"] = x["timings"]          # llama.cpp's field: the speed its clients show
+                yield last
 
 
 def _is_json(text: str) -> bool:
@@ -1889,59 +2113,60 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
         return ("content_block_stop", {"type": "content_block_stop", "index": index})
 
     streamed, finished = set(), set()              # calls sent piece by piece; those whose final tool_call came (#211)
-    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel):
-        if kind == "ping":
-            yield None
-            continue
-        if kind == "event":
-            ev: Event = x
-            if ev.kind == "tool_args":
-                yield "content_block_delta", {"type": "content_block_delta", "index": index,
-                                              "delta": {"type": "input_json_delta", "partial_json": ev.text}}
+    with contextlib.closing(svc.run(ids, thinking, tools, max_new, req, cancel)) as source:
+        for kind, x in source:
+            if kind == "ping":
+                yield None
                 continue
-            if ev.kind == "tool_call" and ev.call.id in streamed:
-                finished.add(ev.call.id)
-                continue
-            want = {"reasoning": "thinking", "content": "text", "tool_call": "tool_use", "tool_start": "tool_use"}[ev.kind]
-            if ev.kind not in ("tool_call", "tool_start") and not ev.text:
-                continue
-            if ev.kind == "tool_start":
-                streamed.add(ev.call.id)
-                used_tool = True
-            if open_kind != want or want == "tool_use":
+            if kind == "event":
+                ev: Event = x
+                if ev.kind == "tool_args":
+                    yield "content_block_delta", {"type": "content_block_delta", "index": index,
+                                                  "delta": {"type": "input_json_delta", "partial_json": ev.text}}
+                    continue
+                if ev.kind == "tool_call" and ev.call.id in streamed:
+                    finished.add(ev.call.id)
+                    continue
+                want = {"reasoning": "thinking", "content": "text", "tool_call": "tool_use", "tool_start": "tool_use"}[ev.kind]
+                if ev.kind not in ("tool_call", "tool_start") and not ev.text:
+                    continue
+                if ev.kind == "tool_start":
+                    streamed.add(ev.call.id)
+                    used_tool = True
+                if open_kind != want or want == "tool_use":
+                    if open_kind is not None:
+                        yield close()
+                    index += 1
+                    open_kind = want
+                    block = {"thinking": {"type": "thinking", "thinking": "", "signature": ""},
+                             "text": {"type": "text", "text": ""},
+                             "tool_use": {"type": "tool_use", "id": ev.call.id if ev.call else "", "name":
+                                          ev.call.name if ev.call else "", "input": {}}}[want]
+                    yield "content_block_start", {"type": "content_block_start", "index": index, "content_block": block}
+                if want == "thinking":
+                    yield "content_block_delta", {"type": "content_block_delta", "index": index,
+                                                  "delta": {"type": "thinking_delta", "thinking": ev.text}}
+                elif want == "text":
+                    yield "content_block_delta", {"type": "content_block_delta", "index": index,
+                                                  "delta": {"type": "text_delta", "text": ev.text}}
+                elif ev.kind == "tool_start":
+                    pass                                # its input follows as tool_args pieces
+                else:
+                    used_tool = True
+                    yield "content_block_delta", {"type": "content_block_delta", "index": index, "delta": {
+                        "type": "input_json_delta", "partial_json": json.dumps(ev.call.arguments, ensure_ascii=False)}}
+            else:
                 if open_kind is not None:
                     yield close()
-                index += 1
-                open_kind = want
-                block = {"thinking": {"type": "thinking", "thinking": "", "signature": ""},
-                         "text": {"type": "text", "text": ""},
-                         "tool_use": {"type": "tool_use", "id": ev.call.id if ev.call else "", "name":
-                                      ev.call.name if ev.call else "", "input": {}}}[want]
-                yield "content_block_start", {"type": "content_block_start", "index": index, "content_block": block}
-            if want == "thinking":
-                yield "content_block_delta", {"type": "content_block_delta", "index": index,
-                                              "delta": {"type": "thinking_delta", "thinking": ev.text}}
-            elif want == "text":
-                yield "content_block_delta", {"type": "content_block_delta", "index": index,
-                                              "delta": {"type": "text_delta", "text": ev.text}}
-            elif ev.kind == "tool_start":
-                pass                                # its input follows as tool_args pieces
-            else:
-                used_tool = True
-                yield "content_block_delta", {"type": "content_block_delta", "index": index, "delta": {
-                    "type": "input_json_delta", "partial_json": json.dumps(ev.call.arguments, ensure_ascii=False)}}
-        else:
-            if open_kind is not None:
-                yield close()
-            stop = "tool_use" if used_tool and streamed <= finished and x["finish"] == "stop" else \
-                {"stop": "end_turn", "length": "max_tokens", "cancel": "end_turn"}[x["finish"]]
-            # the final counts, Anthropic's way: input_tokens leaves out what the conversation cache already held,
-            # which is cache_read_input_tokens (message_start could only say the whole prompt)
-            reused = min(x.get("reused") or 0, len(ids))
-            yield "message_delta", {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": None},
-                                    "usage": {"input_tokens": len(ids) - reused, "cache_read_input_tokens": reused,
-                                              "output_tokens": x["completion_tokens"]}}
-            yield "message_stop", {"type": "message_stop"}
+                stop = "tool_use" if used_tool and streamed <= finished and x["finish"] == "stop" else \
+                    {"stop": "end_turn", "length": "max_tokens", "cancel": "end_turn"}[x["finish"]]
+                # the final counts, Anthropic's way: input_tokens leaves out what the conversation cache already held,
+                # which is cache_read_input_tokens (message_start could only say the whole prompt)
+                reused = min(x.get("reused") or 0, len(ids))
+                yield "message_delta", {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": None},
+                                        "usage": {"input_tokens": len(ids) - reused, "cache_read_input_tokens": reused,
+                                                  "output_tokens": x["completion_tokens"]}}
+                yield "message_stop", {"type": "message_stop"}
 
 
 def anthropic_collect(events) -> dict:
@@ -2194,6 +2419,8 @@ def make_handler(svc: Service):
                         s["tokens_per_s_mean"] = round(svc._tok_s_mean(), 1)
                 for k in ("started", "first_token"):
                     s.pop(k, None)
+                if svc.capacity > 1:
+                    s["slots"] = svc.slot_snapshot()
                 self._json(200, s)
             elif path in ("/v1/models", "/models"):
                 if self._authorized():
@@ -2215,10 +2442,13 @@ def make_handler(svc: Service):
             elif path == "/slots":
                 if self._authorized():
                     loaded = not hasattr(svc.engine, "alive") or svc.engine.alive()
-                    with svc.status_lock:
-                        busy = bool(svc.status.get("busy"))
-                    slot = {"id": 0, "n_ctx": svc.engine.max_context, "is_processing": busy}
-                    self._json(200, [slot] if loaded else [])
+                    if svc.capacity > 1:
+                        slots = [{**s, "n_ctx": svc.engine.max_context} for s in svc.slot_snapshot()]
+                    else:
+                        with svc.status_lock:
+                            busy = bool(svc.status.get("busy"))
+                        slots = [{"id": 0, "n_ctx": svc.engine.max_context, "is_processing": busy}]
+                    self._json(200, slots if loaded else [])
             elif path == "/v1/status":
                 if self._authorized():
                     self._json(200, svc.v1_status())
@@ -2333,7 +2563,7 @@ def make_handler(svc: Service):
                                "presence_penalty", "frequency_penalty", "penalty_last_n")}
             params["n_predict"] = svc.shared.get("max_tokens", -1)
             props = {"default_generation_settings": {"n_ctx": svc.engine.max_context, "params": params},
-                     "total_slots": 1, "model_alias": svc.model, "chat_template": svc.template.source,
+                     "total_slots": svc.capacity, "model_alias": svc.model, "chat_template": svc.template.source,
                      "modalities": {"vision": svc.vision is not None}, "models_autoload": hasattr(svc.engine, "restart"),
                      "is_sleeping": not svc.loaded()}
             if getattr(svc.engine, "model_path", None):
@@ -2847,6 +3077,8 @@ def main() -> int:
                     help="the mock engine's answer (default: a short greeting); given more than once, requests get "
                          "them in turn and the last one repeats")
     ap.add_argument("--port", type=int, default=None, help="default: \"port\" in the config, else 8095")
+    ap.add_argument("--slots", type=int, choices=(1, 2), default=None,
+                    help="resident MiMo request slots (default: config slots, else 1; two is text-only)")
     ap.add_argument("--gpu", help="the GPU to run on, as nvidia-smi numbers them, or several for a layer split "
                                   "(\"0,2\"; also \"gpu\" in the config)")
     ap.add_argument("--tokenizer", default=str(ROOT / "pack/full/tokenizer"),
@@ -2875,6 +3107,14 @@ def main() -> int:
                                           "server's model; also \"before_load\" in the config, a string or a list)")
     a = ap.parse_args()
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
+    try:
+        slots = resolve_slots(cfg, a.slots)
+        if a.engine == "strata" and cfg:
+            slot_engine_args(cfg, slots)       # validate before loading the tokenizer/model
+        if slots == 2 and (a.engine != "strata" or cfg.get("vision")):
+            raise ValueError("slots=2 requires text-only MiMo (--engine strata, family=mimo, no vision)")
+    except ValueError as e:
+        ap.error(str(e))
     if a.gpu is not None:
         cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can
@@ -2934,7 +3174,9 @@ def main() -> int:
             silence = engine_silence_s(cfg)             # #481: checked before the (minutes-long) start
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
-        engine = StrataEngine(exe, engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=env, lazy=lazy)
+        engine_class = MiMoEngine if slots == 2 else StrataEngine
+        engine = engine_class(exe, slot_engine_args(cfg, slots), cwd=cfg.get("cwd"), log=cfg.get("log"),
+                              env=env, lazy=lazy)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"))
         note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],

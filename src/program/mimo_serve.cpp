@@ -6,11 +6,14 @@
 // Sampling keys: temperature, top_p, top_k, min_p, penalty_repeat, penalty_freq, penalty_present, penalty_last_n,
 // seed; others are ignored.  The KV of the last request is kept: a prompt that starts with it reuses it (backing up
 // 128 tokens when it diverges far enough back that the sliding-window rings no longer hold the keys it needs).
+// With --slots 2, READY adds multiplex=1 slots=2. GEN has <command-id> <slot-id> before max_new; STOP has a
+// command-id, and every request event has that id after its kind. The two VRAM caches share one compute owner;
+// generation steps and complete prompt chunks alternate. Context is per slot. Old one-slot clients are unchanged.
 //
 //   strata-mimo --serve --native <model.gguf> [--mtp <mtp.gguf>] [--expert-profile <MIMOPROF>]
 //               [--max-context N] [--eos-ids a,b] [--budget-gib G]          (unknown flags are ignored)
 #include "strata/mimo/decoder.hpp"
-#include "strata/mimo/sampling.hpp"
+#include "strata/mimo/serve.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -39,17 +42,19 @@ struct Input {
     std::condition_variable cv;
     std::deque<std::string> lines;
     bool eof = false;
+    bool multiplex = false;
     std::atomic<bool> busy{false}, stop{false};
 
     void run() {
         std::string line;
         while (std::getline(std::cin, line)) {
             if (!line.empty() && line.back() == '\r') line.pop_back();
-            if (line == "STOP") {
+            if (!multiplex && line == "STOP") {
                 if (busy) stop = true;   // a STOP between requests is stale
                 continue;
             }
-            std::lock_guard<std::mutex> lk(mu);
+            std::unique_lock<std::mutex> lk(mu);
+            if (multiplex) cv.wait(lk, [&] { return lines.size() < 64; });
             lines.push_back(line);
             cv.notify_one();
         }
@@ -63,7 +68,20 @@ struct Input {
         if (lines.empty()) return false;
         out = std::move(lines.front());
         lines.pop_front();
+        cv.notify_one();
         return true;
+    }
+    bool poll(std::string& out) {
+        std::lock_guard<std::mutex> lk(mu);
+        if (lines.empty()) return false;
+        out = std::move(lines.front());
+        lines.pop_front();
+        cv.notify_one();
+        return true;
+    }
+    bool closed() {
+        std::lock_guard<std::mutex> lk(mu);
+        return eof && lines.empty();
     }
 };
 
@@ -74,38 +92,7 @@ void say(const std::string& s) {
 }
 
 bool parse_gen(const std::string& line, int& max_new, SamplingParams& sp, std::vector<int32_t>& ids, std::string& err) {
-    std::istringstream in(line);
-    std::string word;
-    in >> word >> max_new;
-    if (!in || max_new < 0) { err = "bad request: GEN needs <max_new>"; return false; }
-    sp = SamplingParams{};
-    while (in >> word) {
-        const size_t eq = word.find('=');
-        if (eq == std::string::npos) {   // the id list
-            std::stringstream ls(word);
-            std::string v;
-            while (std::getline(ls, v, ',')) {
-                if (v.empty()) continue;
-                char* end = nullptr;
-                const long id = std::strtol(v.c_str(), &end, 10);
-                if (*end) { err = "bad request: token id '" + v + "'"; return false; }
-                ids.push_back((int32_t) id);
-            }
-            break;
-        }
-        const std::string k = word.substr(0, eq), v = word.substr(eq + 1);
-        if (k == "temperature") sp.temperature = std::strtof(v.c_str(), nullptr);
-        else if (k == "top_p") sp.top_p = std::strtof(v.c_str(), nullptr);
-        else if (k == "top_k") sp.top_k = std::atoi(v.c_str());
-        else if (k == "min_p") sp.min_p = std::strtof(v.c_str(), nullptr);
-        else if (k == "penalty_repeat") sp.penalty_repeat = std::strtof(v.c_str(), nullptr);
-        else if (k == "penalty_freq") sp.penalty_freq = std::strtof(v.c_str(), nullptr);
-        else if (k == "penalty_present") sp.penalty_present = std::strtof(v.c_str(), nullptr);
-        else if (k == "penalty_last_n") sp.penalty_last_n = std::atoi(v.c_str());
-        else if (k == "seed") sp.seed = std::strtoull(v.c_str(), nullptr, 10);
-    }
-    if (ids.empty()) { err = "bad request: no prompt tokens"; return false; }
-    return true;
+    return serve_parse_gen(line, max_new, sp, ids, err);
 }
 
 }  // namespace
@@ -116,6 +103,7 @@ int main(int argc, char** argv) {
     std::string model_path;
     std::set<int32_t> eos = {151645, 151643};   // <|im_end|>, <|endoftext|>
     bool serve = false;
+    int prefill_quantum = 2048;
     std::string save_path;          // the learned profile (Strata's #477 protocol): on QUIT and every N minutes
     double save_every_min = 10;
     for (int i = 1; i < argc; ++i) {
@@ -129,7 +117,25 @@ int main(int argc, char** argv) {
         else if (a == "--mtp") val(cfg.mtp_path);
         else if (a == "--expert-profile") val(cfg.profile);
         else if (a == "--max-context") { val(v); cfg.max_ctx = std::atoi(v.c_str()); }
+        else if (a == "--slots" || a == "--prefill-quantum") {
+            val(v);
+            uint64_t count = 0;
+            if (!serve_uint(v, count) || (a == "--slots" ? count < 1 || count > 2 : count < 1 || count > 16384)) {
+                std::fprintf(stderr, "strata-mimo: %s needs %s\n", a.c_str(), a == "--slots" ? "1 or 2" : "1..16384 tokens");
+                return 2;
+            }
+            if (a == "--slots") cfg.slots = (int) count;
+            else prefill_quantum = (int) count;
+        }
         else if (a == "--budget-gib") { val(v); cfg.expert_budget_gib = std::atof(v.c_str()); }
+        else if (a == "--ram-copy") {
+            val(v);
+            if (v != "0" && v != "1") {
+                std::fprintf(stderr, "strata-mimo: --ram-copy needs 0 or 1\n");
+                return 2;
+            }
+            cfg.ram_copy = v == "1";
+        }
         else if (a == "--batched-min") { val(v); cfg.batched_min_prompt = std::atoi(v.c_str()); }
         else if (a == "--expert-profile-save") val(save_path);
         else if (a == "--expert-profile-save-every") { val(v); save_every_min = std::atof(v.c_str()); }
@@ -145,7 +151,7 @@ int main(int argc, char** argv) {
     }
     if (!serve || model_path.empty()) {
         std::fprintf(stderr, "usage: %s --serve --native <model.gguf> [--mtp <mtp.gguf>] [--expert-profile <file>] "
-                             "[--max-context N] [--eos-ids a,b]\n", argv[0]);
+                             "[--max-context N] [--eos-ids a,b] [--slots 1|2] [--prefill-quantum N] [--ram-copy 0|1]\n", argv[0]);
         return 2;
     }
     try {
@@ -161,11 +167,17 @@ int main(int argc, char** argv) {
                      std::chrono::duration<double>(clk::now() - t_load).count(), dec.resident_experts(),
                      dec.has_mtp() ? "on" : "off");
         say("INFO engine=strata-mimo resident_experts=" + std::to_string(dec.resident_experts()) +
-            " vram_free_mib=" + std::to_string(dec.vram_free_after_init() >> 20) + " mtp=" + (dec.has_mtp() ? "1" : "0"));
-        say("READY " + std::to_string(cfg.max_ctx) + " stop");
+            " vram_free_mib=" + std::to_string(dec.vram_free_after_init() >> 20) + " mtp=" + (dec.has_mtp() ? "1" : "0") +
+            " ram_copy=" + (cfg.ram_copy ? "1" : "0"));
+        if (cfg.slots == 2)
+            say("INFO slots=2 context_per_slot=" + std::to_string(cfg.max_ctx) +
+                " kv_bytes=" + std::to_string(dec.kv_bytes()) + " prefill_quantum=" + std::to_string(prefill_quantum));
+        say("READY " + std::to_string(cfg.max_ctx) + " stop" + (cfg.slots == 2 ? " multiplex=1 slots=2" : ""));
 
-        Input input;
-        std::thread reader([&] { input.run(); });
+        auto input_owner = std::make_shared<Input>();
+        Input& input = *input_owner;
+        input.multiplex = cfg.slots == 2;
+        std::thread reader([input_owner] { input_owner->run(); });
         reader.detach();   // blocked in getline at exit; the process ends with it
 
         const int V = dec.vocab();
@@ -181,6 +193,32 @@ int main(int argc, char** argv) {
             if (!dec.save_profile(save_path, e)) std::fprintf(stderr, "strata-mimo: %s\n", e.c_str());
             last_save = clk::now();
         };
+        if (cfg.slots == 2) {
+            ServeOptions options;
+            options.max_context = cfg.max_ctx;
+            options.prefill_quantum = prefill_quantum;
+            options.ring_capacity = kSwaRing;
+            options.eos = eos;
+            MimoServeScheduler<MimoDecoder> scheduler(dec, options, say);
+            try {
+                while (true) {
+                    if (!scheduler.active()) {
+                        if (scheduler.quitting() || !input.next(line)) break;
+                        scheduler.command(line);
+                    }
+                    // Bounded input draining prevents a stream of commands from starving admitted compute.
+                    for (int i = 0; i < 64 && input.poll(line); ++i) scheduler.command(line);
+                    if (input.closed()) scheduler.shutdown();
+                    if (!scheduler.step(err)) throw std::runtime_error(err);
+                    save_learned(false);
+                }
+            } catch (const std::exception& e) {
+                scheduler.fail_all(e.what());
+                throw;
+            }
+            save_learned(true);
+            return 0;
+        }
         while (input.next(line)) {
             if (line == "QUIT") break;
             save_learned(false);

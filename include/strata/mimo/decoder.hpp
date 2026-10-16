@@ -31,6 +31,7 @@ class CpuExperts;
 class PrefillMoe;
 
 struct DecoderConfig {
+    int slots = 1;                  // independent sequences (1 or 2); all compute and weights stay shared
     int max_ctx = 262144;           // positions of the global layers' KV caches
     double expert_budget_gib = 0;   // VRAM for resident experts; 0 = everything left after the rest, minus a margin
     std::string profile;            // MIMOPROF file (tools/mimo/make_profile.py); empty = no resident experts
@@ -100,6 +101,35 @@ public:
     using ChooseFn = std::function<int32_t(const float* logits, int32_t greedy)>;
     bool prompt(const int32_t* tokens, int n, int pos0, const ChooseFn& choose, int32_t* first, int32_t* draft,
                 const std::function<void(int)>& progress, std::string& err);
+    // All execution calls are serialized by the caller. Finish main/MTP/draft2 before switching slots.
+    bool forward(int slot, const int32_t* tokens, int T, int pos0, int32_t* next, std::vector<float>* logits,
+                 std::string& err);
+    bool mtp_forward(int slot, const int32_t* tokens, int T, int pos0, int32_t* draft, std::string& err);
+    bool mtp_draft2(int slot, int32_t d1, int pos, int32_t* d2, std::string& err);
+    bool prompt(int slot, const int32_t* tokens, int n, int pos0, const ChooseFn& choose, int32_t* first,
+                int32_t* draft, const std::function<void(int)>& progress, std::string& err);
+    // Fresh invalidation only, NOT retained-prefix continuation. Graph addresses remain valid.
+    bool reset_sequence(int slot, std::string& err);
+    struct PromptState {
+        std::vector<std::vector<uint32_t>> counts;
+        uint64_t tokens = 0;
+        int slot = -1, next_pos = -1;
+        bool finished = false;
+    };
+    // Nonfinal choose must return the next actual prompt token, without consuming sampling RNG.
+    // Each return is a safe scheduling boundary: the borrowed expert slots have been refilled.
+    bool prompt_chunk(int slot, const int32_t* tokens, int n, int pos0, const ChooseFn& choose, int32_t* first,
+                      int32_t* draft, const std::function<void(int)>& progress, PromptState& state, bool final,
+                      std::string& err);
+    size_t kv_bytes() const {
+        size_t bytes = 0;
+        for (const auto& seq : sequences_) {
+            for (const auto& kv : seq->kv) bytes += attn_kv_bytes(kv.n_kv, kv.cap);
+            if (seq->mtp_kv.k) bytes += attn_kv_bytes(seq->mtp_kv.n_kv, seq->mtp_kv.cap);
+            if (seq->mtp2_kv.k) bytes += attn_kv_bytes(seq->mtp2_kv.n_kv, seq->mtp2_kv.cap);
+        }
+        return bytes;
+    }
     int vocab() const { return model_.geometry().n_vocab; }
     size_t vram_free_after_init() const { return vram_free_after_init_; }
 
@@ -114,15 +144,15 @@ public:
     int resident_experts() const { return n_resident_; }
 
 private:
-    bool forward_graph(int T, int pos0, int32_t* next, std::string& err);
+    bool forward_graph(int slot, int T, int pos0, int32_t* next, std::string& err);
     // the batched prompt path (src/mimo/prefill.cpp)
     bool prefill_alloc(std::string& err);
     bool prefill_place(std::string& err);
-    void commit_swaps(bool wait);
+    bool commit_swaps(bool wait, std::string& err);
     bool borrow_slots(std::string& err);
     bool refill_slots(const std::vector<std::vector<uint32_t>>* counts, std::string& err);
-    bool prompt_batched(const int32_t* tokens, int n, int pos0, const ChooseFn& choose, int32_t* first, int32_t* draft,
-                        const std::function<void(int)>& progress, std::string& err);
+    bool prompt_batched(int slot, const int32_t* tokens, int n, int pos0, const ChooseFn& choose, int32_t* first, int32_t* draft,
+                        const std::function<void(int)>& progress, PromptState& state, bool final, std::string& err);
     void gemm_q8(const DevTensor& w, uint16_t* scratch, bool dequant, const uint16_t* x16, float* y, int T);
     void prefill_attention(const DevTensor& attn_norm, const DevTensor& qkv, const DevTensor& out, const AttnLayer& L,
                            const AttnKv& kv, float* x, int T, int pos, bool dq_qkv, bool dq_out);
@@ -137,11 +167,11 @@ private:
     bool adapt_window(int T, std::string& err);
     struct MtpLayer;
     bool load_mtp(std::string& err);
-    bool load_mtp_layer(int k, MtpLayer& m, void*& arena, AttnKv& kv, AttnLayer& al, std::string& err);
+    bool load_mtp_layer(int k, MtpLayer& m, void*& arena, AttnLayer& al, std::string& err);
     void mtp_layer_enqueue(const MtpLayer& m, const AttnKv& kv, const AttnLayer& al, const int32_t* tok,
                            const int32_t* pos, const float* hsrc, float* mres, int T, bool head);
-    void mtp_enqueue(int T);
-    bool capture(int T, std::string& err);
+    void mtp_enqueue(int slot, int T);
+    bool capture(int slot, int T, std::string& err);
     void release_gpu_waits();
     void dump(const char* name, int layer, const void* dev, size_t bytes_per_token, int T, bool is_int = false);
 
@@ -151,7 +181,18 @@ private:
     cudaStream_t stream_ = nullptr;
     std::vector<void*> allocs_;     // device allocations owned here
     void* pinned_ = nullptr;        // host staging for expert uploads
-    std::vector<AttnKv> kv_;
+    struct Sequence {
+        std::vector<AttnKv> kv;
+        AttnKv mtp_kv{}, mtp2_kv{};
+        cudaGraphExec_t graphs[9] = {}, mtp_graphs[9] = {};
+        cudaGraphExec_t draft2_graph = nullptr;
+    };
+    std::vector<std::unique_ptr<Sequence>> sequences_;   // stable KV addresses until destruction
+    bool valid_slot(int slot, std::string& err) const;
+    bool initialized_ = false;
+    bool failed_ = false;                       // unsafe GPU/borrow failure: no further execution
+    int hidden_slot_ = -1, mtp_hidden_slot_ = -1;
+    std::vector<std::vector<uint32_t>>* prompt_counts_ = nullptr;
     std::vector<AttnLayer> attn_;
     AttnScratch attn_scratch_{};
     // activations ([T][...] each)
@@ -188,7 +229,6 @@ private:
     float* cpu_out_ = nullptr;                 // device copy of the CPU's sums
     long long prev_affinity_ = -1;
     // v2: the window graphs and the mapped handoff (host pointer h_*, device alias m_*)
-    cudaGraphExec_t graphs_[9] = {};
     int32_t* d_res_ = nullptr;                 // [layer][expert] -> resident slot or -1, on the device
     float *h_x_ = nullptr, *m_x_ = nullptr, *h_w_ = nullptr, *m_w_ = nullptr, *h_out_ = nullptr, *m_out_ = nullptr;
     int32_t *h_ids_ = nullptr, *m_ids_ = nullptr;
@@ -201,10 +241,7 @@ private:
     } mtp_, mtp2_;
     void* mtp_arena_ = nullptr;
     void* mtp2_arena_ = nullptr;
-    AttnKv mtp_kv_{}, mtp2_kv_{};
     AttnLayer mtp_attn_{}, mtp2_attn_{};
-    cudaGraphExec_t mtp_graphs_[9] = {};
-    cudaGraphExec_t draft2_graph_ = nullptr;
     float *mres2_ = nullptr, *hd_ = nullptr;   // the second layer's residual; the first layer's last row
     int32_t *d2_tok_ = nullptr, *d2_pos_ = nullptr;
     float *e_ = nullptr, *cat_ = nullptr, *mres_ = nullptr;

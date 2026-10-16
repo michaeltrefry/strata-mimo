@@ -103,19 +103,18 @@ bool MimoDecoder::prefill_place(std::string& err) {
 }
 
 // Finished background copies become resident (wait: all of them, after the copy stream drains).
-void MimoDecoder::commit_swaps(bool wait) {
-    if (!copy_stream_ || in_flight_.empty()) return;
-    if (wait) cudaStreamSynchronize(copy_stream_);
-    std::string err;
+bool MimoDecoder::commit_swaps(bool wait, std::string& err) {
+    if (!copy_stream_ || in_flight_.empty()) return true;
+    if (wait && !ok(cudaStreamSynchronize(copy_stream_), "copy boundary", err)) return false;
     windows_since_adapt_ = 0;
-    adapt_window(0, err);   // T = 0: commits only, no decay; the interval reset above keeps it from starting copies
+    return adapt_window(0, err);   // T = 0: commits only, no decay; the interval reset above keeps it from starting copies
 }
 
 // Before a batched prompt: the experts in the borrowed slots stop being resident (their slots hold the prompt's
 // buffers until refill_slots), and no background copy may still target them.
 bool MimoDecoder::borrow_slots(std::string& err) {
     const MimoGeometry& g = model_.geometry();
-    commit_swaps(true);
+    if (!commit_swaps(true, err)) return false;
     for (int l = 0; l < g.n_layer; ++l)
         for (int e = 0; e < g.n_expert; ++e)
             if (resident_[(size_t) l][(size_t) e] >= borrow_lo_) resident_[(size_t) l][(size_t) e] = -1;
@@ -165,9 +164,9 @@ bool MimoDecoder::refill_slots(const std::vector<std::vector<uint32_t>>* counts,
         const int l = cand[i].second / ne, e = cand[i].second % ne, slot = free_slots[i];
         const ExpertSlices& src = cpu_ ? cpu_->source(l) : model_.experts(l);
         uint8_t* raw = (uint8_t*) raw_;
-        cudaMemcpyAsync(raw, src.matrix(0, e), src.stride[0], cudaMemcpyHostToDevice, s);
-        cudaMemcpyAsync(raw + src.stride[0], src.matrix(1, e), src.stride[1], cudaMemcpyHostToDevice, s);
-        cudaMemcpyAsync(raw + src.stride[0] + src.stride[1], src.matrix(2, e), src.stride[2], cudaMemcpyHostToDevice, s);
+        if (!ok(cudaMemcpyAsync(raw, src.matrix(0, e), src.stride[0], cudaMemcpyHostToDevice, s), "expert transfer", err)) return false;
+        if (!ok(cudaMemcpyAsync(raw + src.stride[0], src.matrix(1, e), src.stride[1], cudaMemcpyHostToDevice, s), "expert transfer", err)) return false;
+        if (!ok(cudaMemcpyAsync(raw + src.stride[0] + src.stride[1], src.matrix(2, e), src.stride[2], cudaMemcpyHostToDevice, s), "expert transfer", err)) return false;
         mxfp4_slot_relayout(raw, (void*) slot_addr_[(size_t) slot], s);
         resident_[(size_t) l][(size_t) e] = slot;
     }
@@ -225,8 +224,8 @@ void MimoDecoder::prefill_dump(const char* name, int layer, const float* dev, si
     std::ofstream(f, std::ios::binary | std::ios::app).write((const char*) host.data(), (std::streamsize) host.size() * 4);
 }
 
-bool MimoDecoder::prompt_batched(const int32_t* tokens, int n, int pos0, const ChooseFn& choose, int32_t* first,
-                                 int32_t* draft, const std::function<void(int)>& progress, std::string& err) {
+bool MimoDecoder::prompt_batched(int slot, const int32_t* tokens, int n, int pos0, const ChooseFn& choose, int32_t* first,
+                                 int32_t* draft, const std::function<void(int)>& progress, PromptState& state, bool final, std::string& err) {
     const MimoGeometry& g = model_.geometry();
     const int E = g.n_embd, K = g.n_expert_used, V = g.n_vocab;
     cudaStream_t s = stream_;
@@ -235,7 +234,7 @@ bool MimoDecoder::prompt_batched(const int32_t* tokens, int n, int pos0, const C
     if (borrow_lo_ >= 0 && !borrow_slots(err)) return false;
     std::vector<int32_t> res(g.n_expert);
     // the prompt's routing, for adapt_residency: picks per layer and expert
-    const bool adapt = n >= cfg_.adapt_min_prompt && !profile_score_.empty();
+    const bool adapt = final && state.tokens + (uint64_t) n >= (uint64_t) cfg_.adapt_min_prompt && !profile_score_.empty();
     std::vector<std::vector<uint32_t>> counts((size_t) g.n_layer, std::vector<uint32_t>((size_t) g.n_expert));
     std::vector<int32_t> picks;
     std::vector<float> last_logits(V);
@@ -250,7 +249,7 @@ bool MimoDecoder::prompt_batched(const int32_t* tokens, int n, int pos0, const C
             for (int r = 0; r < S; r += cfg_.prefill_tile) {
                 const int T = std::min(cfg_.prefill_tile, S - r);
                 float* x = pX_ + (size_t) r * E;
-                prefill_attention(w.attn_norm, w.attn_qkv, w.attn_output, attn_[(size_t) l], kv_[(size_t) l], x, T,
+                prefill_attention(w.attn_norm, w.attn_qkv, w.attn_output, attn_[(size_t) l], sequences_[(size_t) slot]->kv[(size_t) l], x, T,
                                   base + r, r == 0, r == 0);
                 float* hn = pHn_ + (size_t) r * E;
                 mimo_rmsnorm(x, (const float*) w.ffn_norm.data, hn, E, T, g.rms_eps, s);
@@ -280,10 +279,14 @@ bool MimoDecoder::prompt_batched(const int32_t* tokens, int n, int pos0, const C
                 pmoe_->run_layer(ml, s);
                 {   // the slice's picks: prompt-driven residency and the learned profile
                     picks.resize((size_t) S * K);
-                    cudaMemcpyAsync(picks.data(), pIds_, sizeof(int32_t) * picks.size(), cudaMemcpyDeviceToHost, s);
-                    cudaStreamSynchronize(s);
+                    if (!ok(cudaMemcpyAsync(picks.data(), pIds_, sizeof(int32_t) * picks.size(), cudaMemcpyDeviceToHost, s),
+                            "prompt routing", err) || !ok(cudaStreamSynchronize(s), "prompt routing", err)) return false;
                     for (int32_t e : picks)
-                        if (e >= 0 && e < g.n_expert) ++counts[(size_t) l][(size_t) e];
+                        if (e >= 0 && e < g.n_expert) {
+                            ++counts[(size_t) l][(size_t) e];
+                            ++stats_.expert_uses;
+                            stats_.expert_hits += res[(size_t) e] >= 0;
+                        }
                 }
                 add_scaled(pX_, pY_, 1.f, E * S, s);
             }
@@ -297,19 +300,20 @@ bool MimoDecoder::prompt_batched(const int32_t* tokens, int n, int pos0, const C
             strata::kernels::native_q8_0_f32(model_.output().data, h_, q8_, logits_, E, V, 1, s);
             argmax_rows(logits_, next_, 1, V, s);
             int32_t greedy = 0;
-            cudaMemcpyAsync(&greedy, next_, 4, cudaMemcpyDeviceToHost, s);
+            if (!ok(cudaMemcpyAsync(&greedy, next_, 4, cudaMemcpyDeviceToHost, s), "prompt transfer", err)) return false;
             if (!ok(cudaMemcpyAsync(last_logits.data(), logits_, sizeof(float) * V, cudaMemcpyDeviceToHost, s), "logits", err) ||
                 !ok(cudaStreamSynchronize(s), "prompt slice", err))
                 return false;
             *first = choose(last_logits.data(), greedy);
+            if (*first < 0 || *first >= V) { err = "prompt chooser returned invalid token"; return false; }
         }
         // decode reads the window's final hidden state from x_: leave the slice's last position there
-        cudaMemcpyAsync(x_, xl, sizeof(float) * E, cudaMemcpyDeviceToDevice, s);
+        if (!ok(cudaMemcpyAsync(x_, xl, sizeof(float) * E, cudaMemcpyDeviceToDevice, s), "prompt transfer", err)) return false;
         if (has_mtp()) {   // the MTP layers over positions base + 1 .. base + S: token p with the state at p - 1
             std::vector<int32_t> mt((size_t) S);
             for (int j = 0; j < S; ++j) mt[(size_t) j] = done + j + 1 < n ? tokens[done + j + 1] : *first;
-            cudaMemcpyAsync(pTok_, mt.data(), sizeof(int32_t) * S, cudaMemcpyHostToDevice, s);
-            auto run_layer = [&](const MtpLayer& m, const AttnKv& kv, const AttnLayer& al) {
+            if (!ok(cudaMemcpyAsync(pTok_, mt.data(), sizeof(int32_t) * S, cudaMemcpyHostToDevice, s), "prompt transfer", err)) return false;
+            auto run_layer = [&](const MtpLayer& m, const AttnKv& kv, const AttnLayer& al) -> bool {
                 embed_q8_0(model_.token_embd().data, pTok_, pY_, S, E, s);   // pY_: the MTP layer's token rows
                 bool first_tile = true;
                 for (int r = 0; r < S; r += cfg_.prefill_tile) {
@@ -323,33 +327,38 @@ bool MimoDecoder::prompt_batched(const int32_t* tokens, int n, int pos0, const C
                     gemm_q8(m.eh_proj, pW1_, true, p16_, mr, T);
                     prefill_attention(m.attn_norm, m.attn_qkv, m.attn_output, al, kv, mr, T, base + 1 + r, true, first_tile);
                     mimo_rmsnorm(mr, (const float*) m.ffn_norm.data, pE_, E, T, g.rms_eps, s);
-                    cudaMemcpyAsync(pA_, pE_, sizeof(float) * T * E, cudaMemcpyDeviceToDevice, s);
+                    if (!ok(cudaMemcpyAsync(pA_, pE_, sizeof(float) * T * E, cudaMemcpyDeviceToDevice, s), "prompt transfer", err)) return false;
                     prefill_dense_ffn(m.ffn_gate, m.ffn_up, m.ffn_down, pA_, mr, T);
                     first_tile = false;
                 }
+                return ok(cudaGetLastError(), "MTP prompt kernels", err);
             };
-            run_layer(mtp_, mtp_kv_, mtp_attn_);
+            if (!run_layer(mtp_, sequences_[(size_t) slot]->mtp_kv, mtp_attn_)) return false;
             const float* ml = pHn_ + (size_t) (S - 1) * E;
             if (last_slice && draft) {
                 mimo_rmsnorm(ml, (const float*) mtp_.out_norm.data, h_, E, 1, g.rms_eps, s);
                 strata::kernels::native_q8_0_f32(model_.output().data, h_, q8_, logits_, E, V, 1, s);
                 argmax_rows(logits_, next_, 1, V, s);
-                cudaMemcpyAsync(draft, next_, 4, cudaMemcpyDeviceToHost, s);
+                if (!ok(cudaMemcpyAsync(draft, next_, 4, cudaMemcpyDeviceToHost, s), "prompt transfer", err)) return false;
             }
             if (has_mtp2()) {   // the second layer: its KV over the same positions; the first one's last row for draft 2
-                cudaMemcpyAsync(hd_, ml, sizeof(float) * E, cudaMemcpyDeviceToDevice, s);
-                run_layer(mtp2_, mtp2_kv_, mtp2_attn_);
+                if (!ok(cudaMemcpyAsync(hd_, ml, sizeof(float) * E, cudaMemcpyDeviceToDevice, s), "prompt transfer", err)) return false;
+                if (!run_layer(mtp2_, sequences_[(size_t) slot]->mtp2_kv, mtp2_attn_)) return false;
             }
         }
-        if (!ok(cudaStreamSynchronize(s), "prompt slice", err)) return false;
+        if (!ok(cudaGetLastError(), "prompt kernels", err) ||
+            !ok(cudaStreamSynchronize(s), "prompt slice", err)) return false;
         done += S;
     }
     if (usage_.empty()) usage_.assign((size_t) g.n_layer * g.n_expert, 0.0);
     for (int l = 0; l < g.n_layer; ++l)
-        for (int e = 0; e < g.n_expert; ++e) usage_[(size_t) l * g.n_expert + e] += counts[(size_t) l][(size_t) e];
+        for (int e = 0; e < g.n_expert; ++e) {
+            usage_[(size_t) l * g.n_expert + e] += counts[(size_t) l][(size_t) e];
+            state.counts[(size_t) l][(size_t) e] += counts[(size_t) l][(size_t) e];
+        }
     usage_tokens_ += (uint64_t) n;
-    if (borrow_lo_ >= 0 && !refill_slots(adapt ? &counts : nullptr, err)) return false;
-    return adapt ? adapt_residency(counts, err) : true;
+    if (borrow_lo_ >= 0 && !refill_slots(adapt ? &state.counts : nullptr, err)) return false;
+    return adapt ? adapt_residency(state.counts, err) : true;
 }
 
 bool MimoDecoder::adapt_residency(const std::vector<std::vector<uint32_t>>& counts, std::string& err) {
@@ -386,9 +395,9 @@ bool MimoDecoder::adapt_residency(const std::vector<std::vector<uint32_t>>& coun
         const int slot = resident_[(size_t) lo][(size_t) eo];
         const ExpertSlices& src = cpu_ ? cpu_->source(li) : model_.experts(li);   // the pinned RAM copy
         uint8_t* raw = (uint8_t*) raw_;
-        cudaMemcpyAsync(raw, src.matrix(0, ei), src.stride[0], cudaMemcpyHostToDevice, s);
-        cudaMemcpyAsync(raw + src.stride[0], src.matrix(1, ei), src.stride[1], cudaMemcpyHostToDevice, s);
-        cudaMemcpyAsync(raw + src.stride[0] + src.stride[1], src.matrix(2, ei), src.stride[2], cudaMemcpyHostToDevice, s);
+        if (!ok(cudaMemcpyAsync(raw, src.matrix(0, ei), src.stride[0], cudaMemcpyHostToDevice, s), "expert transfer", err)) return false;
+        if (!ok(cudaMemcpyAsync(raw + src.stride[0], src.matrix(1, ei), src.stride[1], cudaMemcpyHostToDevice, s), "expert transfer", err)) return false;
+        if (!ok(cudaMemcpyAsync(raw + src.stride[0] + src.stride[1], src.matrix(2, ei), src.stride[2], cudaMemcpyHostToDevice, s), "expert transfer", err)) return false;
         mxfp4_slot_relayout(raw, (void*) slot_addr_[(size_t) slot], s);
         resident_[(size_t) lo][(size_t) eo] = -1;
         resident_[(size_t) li][(size_t) ei] = slot;

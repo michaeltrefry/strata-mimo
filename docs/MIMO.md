@@ -3,8 +3,8 @@
 Strata's engine ported to XiaomiMiMo's MiMo-V2.6-Flash-RL (309B total, 15B active, MXFP4 experts): the attention,
 the dense layer, the routers and ~6,600 of the 12,032 experts on one 96 GB GPU, the rest of the experts in RAM and
 computed by the CPU, MTP speculative decoding, behind Strata's own server (OpenAI and Anthropic APIs).  Coding work
-was the target.  Every number below was measured on one RTX PRO 6000 Blackwell Max-Q (GPU 0), a Threadripper 9960X
-and 512 GB of DDR5-6400, Windows 11.
+was the target.  The single-request speeds below were measured on one RTX PRO 6000 Blackwell Max-Q (GPU 0), a
+Threadripper 9960X and 512 GB of DDR5-6400, Windows 11.
 
 ## What it does
 
@@ -88,6 +88,54 @@ The expert profile: `data/mimo-coding-answers.prof`, made with `python tools/mim
 ```
 
 then `python serve/server.py --engine strata --config <that file> --host 127.0.0.1 --port 8080`.
+
+## Two active requests
+
+Single-slot serving remains the default. To enable two active text requests, add `"slots": 2` at the top level of
+that server config, or pass `--slots 2` to `serve/server.py`. Rebuild `strata-mimo` first: an older engine without the
+multiplex capability is rejected rather than silently running one request at a time. The OpenAI and Anthropic
+request formats do not change.
+
+Both requests keep their own KV cache in VRAM, token history, sampler and MTP draft state. They share one model,
+one expert cache, one pinned RAM copy and one compute workspace. The engine alternates complete generation steps;
+it does not execute two GPU forwards at once, and this is not a claim of doubled throughput. A third request waits
+for a free slot (at most 32 waiting requests; further requests receive a queue-full error). Idle slots prefer the
+longest matching previous prompt as an affinity hint; the engine validates actual reuse. Canceling one request
+does not cancel the other. A client that stops consuming output is canceled if its bounded token queue fills,
+so it cannot block the other client's stream.
+
+`--max-context` is **per slot**, not divided between requests. From the existing int8 cache layout (allocation
+arithmetic, not a two-request measurement):
+
+| Context per slot | Main KV, one slot | Main KV, two slots |
+| --- | ---: | ---: |
+| 65,536 | 0.754 GiB | 1.508 GiB |
+| 131,072 | 1.484 GiB | 2.967 GiB |
+| 262,144 | 2.943 GiB | 5.885 GiB |
+
+Each MTP head adds about 0.65 MiB per slot. The second cache is allocated before sizing the resident experts; at
+256K per slot it costs about 237 expert slots with the current 12.75 MiB expert layout. Startup reports the actual
+resident count and total KV bytes. A fixed `--budget-gib` that no longer fits must be reduced; context is not
+silently shortened.
+
+In two-slot mode, prompt processing also yields after complete chunks, even if the second request has not arrived
+yet. Native `--prefill-quantum N` (in the config's `args`) sets the bulk chunk ceiling; the default is 2,048 tokens.
+While a peer is generating, prompt turns use at most 8 tokens; at the default `--batched-min 128`, these use the
+decode-window path instead, avoiding bulk expert-copy/refill pauses in the live stream. Bulk chunks resume when
+that peer finishes. Prompt throughput
+while sharing with a live stream can be lower; the trade-off is response latency. The engine finishes the whole
+chunk and its MTP work before switching. The chunk size is not a fixed latency guarantee. One-slot mode retains
+the existing bulk prompt path.
+
+For validation beside another installation, native `--ram-copy 0` reads CPU experts from the existing GGUF mapping
+instead of allocating another pinned ~150 GiB copy. The default is `--ram-copy 1`; the mapped path is not the
+configuration used for the speed table above.
+
+The speed table above describes single-slot measurements. [Two-slot validation](MIMO_DECODER.md#http-validation-2026-10-15)
+on GPU 1 checked graph/MTP cache isolation, overlapping streams in both API dialects, cancellation, queued requests
+and a slow reader. It used a smaller 64 GiB expert budget and mapped CPU experts while the other server stayed
+loaded; its timings are not a prediction for the normal full-budget pinned-RAM configuration. The measurements
+include the prompt-throughput cost of protecting an existing stream from a long new prompt.
 
 ## Starting and stopping
 

@@ -497,6 +497,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(mimo_fused_test PRIVATE strata_mimo)
     add_test(NAME mimo_fused_test COMMAND mimo_fused_test)
     set_tests_properties(mimo_fused_test PROPERTIES SKIP_RETURN_CODE 77)
+    # Full decoder slot/logit/MTP isolation: requires the model and runs only when explicitly requested.
+    add_executable(mimo_decoder_slots_test tests/cuda/mimo_decoder_slots_test.cpp)
+    target_link_libraries(mimo_decoder_slots_test PRIVATE strata_mimo)
   endif()
 
   if(STRATA_ENABLE_HIP)
@@ -1179,6 +1182,12 @@ endif()
 
 if(STRATA_BUILD_TESTS)
   enable_testing()
+  # The production two-slot scheduler against a CPU fake: no GPU, model or Python dependencies.
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/mimo/serve_test.cpp")
+    add_executable(mimo_serve_test tests/mimo/serve_test.cpp)
+    target_link_libraries(mimo_serve_test PRIVATE strata_artifact)
+    add_test(NAME mimo_serve_test COMMAND mimo_serve_test)
+  endif()
   # Model-level checks may be absent from source distributions.
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt")
     add_subdirectory(tests)
