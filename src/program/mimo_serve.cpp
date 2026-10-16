@@ -4,8 +4,8 @@
 //   out: INFO k=v ...  READY <max_context> stop          (once, after loading)
 //        RESUME <reused>  PP <pos> <total> <ms> <tok/s> ...  T <id> ...  DONE <14 fields>   |   ERR <message>
 // Sampling keys: temperature, top_p, top_k, min_p, penalty_repeat, penalty_freq, penalty_present, penalty_last_n,
-// seed; others are ignored.  The KV of the last request is kept: a prompt that starts with it reuses it (backing up
-// 128 tokens when it diverges far enough back that the sliding-window rings no longer hold the keys it needs).
+// seed; others are ignored. Without MTP, matching KV is reused while the sliding-window history is still live;
+// otherwise the prompt is replayed in full. Legacy MTP requests always replay to rebuild predecessor/lookahead state.
 // With --slots 2, READY adds multiplex=1 slots=2. GEN has <command-id> <slot-id> before max_new; STOP has a
 // command-id, and every request event has that id after its kind. The two VRAM caches share one compute owner;
 // generation steps and complete prompt chunks alternate. Context is per slot. Old one-slot clients are unchanged.
@@ -219,6 +219,7 @@ int main(int argc, char** argv) {
             save_learned(true);
             return 0;
         }
+        int written_end = 0;   // main KV high-water mark since reset, even after shortening session
         while (input.next(line)) {
             if (line == "QUIT") break;
             save_learned(false);
@@ -244,11 +245,12 @@ int main(int argc, char** argv) {
             // reuse: the longest common prefix with the kept KV, at most n - 1 (the last prompt token always runs)
             int keep = 0;
             while (keep < (int) session.size() && keep < n - 1 && session[(size_t) keep] == ids[(size_t) keep]) ++keep;
-            // the sliding-window layers keep a ring of the last kSwaRing positions of the session; the positions run
-            // from `keep` on need the n_swa - 1 keys before them, which the ring still holds unless keep lies more
-            // than kSwaRing - n_swa + 1 positions back - then back up n_swa positions and rebuild them
-            const bool ring_ok = keep >= (int) session.size() - (kSwaRing - 127);
-            const int start = ring_ok ? keep : std::max(0, keep - 128);
+            // The first replayed token needs its own 127 preceding SWA keys. If those have left the ring,
+            // replay from zero: backing up a suffix cannot reconstruct the missing history exactly.
+            // Legacy MTP also has predecessor-dependent KV and speculative lookahead not tracked by session;
+            // without a validated checkpoint, rebuild all of it rather than reuse a possibly stale draft row.
+            const bool ring_ok = keep >= written_end - (kSwaRing - 127);
+            const int start = ring_ok && !dec.has_mtp() ? keep : 0;
             say("RESUME " + std::to_string(start));
             sampler.begin(sp);
             sampler.history(ids.data(), n);
@@ -264,12 +266,15 @@ int main(int argc, char** argv) {
                         std::to_string(ms > 0 ? done / ms * 1000.0 : 0.0));
             };
             session.assign(ids.begin(), ids.begin() + start);
-            if (!dec.prompt(ids.data() + start, n - start, start, choose, &tok, dec.has_mtp() ? &draft : nullptr, progress, err)) {
+            // Clear wrapped MTP position zero too: prompt() writes MTP from position one onward.
+            if ((start == 0 && !dec.reset_sequence(0, err)) ||
+                !dec.prompt(ids.data() + start, n - start, start, choose, &tok, dec.has_mtp() ? &draft : nullptr, progress, err)) {
                 session.clear();
                 input.busy = false;
                 say("ERR " + err);
                 continue;
             }
+            written_end = start == 0 ? n : std::max(written_end, n);
             session.assign(ids.begin(), ids.end());
             const double prompt_ms = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
             const auto t1 = clk::now();
@@ -289,6 +294,7 @@ int main(int argc, char** argv) {
                     // verify [tok, draft]; the main model's distribution after tok decides whether draft stands
                     int32_t win[2] = {tok, draft};
                     if (!dec.forward(win, 2, pos, next, host_choice ? &logits : nullptr, err)) break;
+                    written_end = std::max(written_end, pos + 2);
                     ++offered;
                     int32_t other = next[0];
                     session.push_back(tok);   // the position the draft is judged at sees tok
@@ -321,6 +327,7 @@ int main(int argc, char** argv) {
                     pos += A;
                 } else {
                     if (!dec.forward(&tok, 1, pos, next, host_choice ? &logits : nullptr, err)) break;
+                    written_end = std::max(written_end, pos + 1);
                     emit(tok);
                     session.push_back(tok);
                     if (host_choice) sampler.history(session.data(), (int) session.size());
