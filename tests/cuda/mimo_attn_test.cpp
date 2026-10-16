@@ -420,6 +420,95 @@ void run_sequence(bool swa, int n_pos, uint32_t seed) {
     attn_scratch_free(scr);
 }
 
+// ---- two KV owners, one scratch set: direct calls and slot-bound graph replay --------------------------------
+void run_slots(bool swa, bool graph, uint32_t seed) {
+    std::mt19937 rng(seed);
+    std::vector<std::unique_ptr<Layer>> layers;
+    for (int slot = 0; slot < 2; ++slot) layers.push_back(std::make_unique<Layer>(swa, 512, rng));
+    AttnScratch scr;
+    std::string err;
+    if (!attn_scratch_alloc(scr, 0, err)) throw std::runtime_error(err);
+    const int n_kv = layers[0]->n_kv;
+    Dev<float> dqkv((size_t) kAttnMaxT * qkv_rows(n_kv)), dq((size_t) kAttnMaxT * H * DK),
+        dout((size_t) kAttnMaxT * H * DV);
+    Dev<int32_t> dpos(1);
+    cudaStream_t stream = nullptr;
+    ck(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "slots stream");
+    cudaGraphExec_t graphs[2][9] = {};
+    int positions[2] = {248, 120};
+    auto snapshot = [&](const Layer& layer) {
+        std::vector<unsigned char> bytes(attn_kv_bytes(layer.n_kv, layer.cap));
+        ck(cudaMemcpy(bytes.data(), layer.kv.k, bytes.size(), cudaMemcpyDeviceToHost), "slot KV snapshot");
+        return bytes;
+    };
+    // Fill both distinct histories; the next turns cross 127/128 and 255/256, at different positions.
+    for (int slot = 0; slot < 2; ++slot) {
+        const auto& layer = *layers[(size_t) slot];
+        for (int pos = 0; pos < positions[slot]; pos += kAttnMaxT) {
+            const int T = std::min(kAttnMaxT, positions[slot] - pos);
+            dqkv.up(random_qkv(T, n_kv, rng));
+            dpos.up({pos});
+            mimo_qkv_rope_append(dqkv.p, dpos.p, T, layer.L, layer.kv, dq.p, stream);
+            ck(cudaStreamSynchronize(stream), "slot history");
+        }
+    }
+    double worst = 0;
+    auto run = [&](int slot, int T, int pos) {
+        const auto& layer = *layers[(size_t) slot];
+        const auto peer = snapshot(*layers[(size_t) (1 - slot)]);
+        dqkv.up(random_qkv(T, n_kv, rng));
+        dpos.up({pos});
+        auto enqueue = [&] {
+            mimo_qkv_rope_append(dqkv.p, dpos.p, T, layer.L, layer.kv, dq.p, stream);
+            mimo_attn_decode(dq.p, dpos.p, T, layer.L, layer.kv, scr, dout.p, stream);
+        };
+        if (graph) {
+            auto& executable = graphs[slot][T];
+            if (!executable) {
+                cudaGraph_t captured = nullptr;
+                ck(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "slot capture");
+                enqueue();
+                ck(cudaStreamEndCapture(stream, &captured), "slot capture end");
+                ck(cudaGraphInstantiate(&executable, captured, 0), "slot instantiate");
+                cudaGraphDestroy(captured);
+                verdict(snapshot(*layers[(size_t) (1 - slot)]) == peer, "capture changed peer KV");
+            }
+            ck(cudaGraphLaunch(executable, stream), "slot graph launch");
+        } else {
+            enqueue();
+        }
+        ck(cudaStreamSynchronize(stream), "slot compute");
+        verdict(snapshot(*layers[(size_t) (1 - slot)]) == peer, "one slot changed peer KV");
+        KvRef q8;
+        layer.dequant(pos + T, q8);
+        auto q = dq.down(), out = dout.down();
+        q.resize((size_t) T * H * DK);
+        out.resize((size_t) T * H * DV);
+        verdict(std::all_of(out.begin(), out.end(), [](float value) { return std::isfinite(value); }),
+                "two-slot attention output finite");
+        std::vector<double> ref;
+        attend_ref(q, q8, pos, T, swa, swa ? layer.sinks_h.data() : nullptr, ref);
+        worst = std::max(worst, compare(out, ref).rel());
+    };
+    for (int turn = 0; turn < 24; ++turn) {
+        const int slot = turn % 2;
+        const int widths[] = {1, 2, 4, 8};
+        const int T = widths[(turn / 2) % 4];
+        run(slot, T, positions[slot]);
+        positions[slot] += turn % 3 == 0 ? 1 : T;   // reject some speculative suffixes
+    }
+    const auto peer = snapshot(*layers[1]);
+    ck(cudaMemset(layers[0]->kv.k, 0, attn_kv_bytes(n_kv, layers[0]->cap)), "slot reset");
+    verdict(snapshot(*layers[1]) == peer, "slot reset changed peer KV");
+    run(0, 2, 0);   // replay the existing graph with reset KV at the same address
+    std::printf("%-6s two slots %s: kernel vs q8 reference rel %.2e\n", swa ? "swa" : "global",
+                graph ? "graphs" : "direct", worst);
+    verdict(std::isfinite(worst) && worst < kTolKernel, "two-slot attention vs reference");
+    for (auto& row : graphs) for (auto executable : row) if (executable) cudaGraphExecDestroy(executable);
+    cudaStreamDestroy(stream);
+    attn_scratch_free(scr);
+}
+
 // ---- the sink: out(sink) = out(no sink) * Z / (Z + exp(sink - max)) per head ------------------------------------
 void run_sinks(int T, int ctx, uint32_t seed) {
     std::mt19937 rng(seed);
@@ -672,6 +761,10 @@ int main(int argc, char** argv) {
         run_case(false, 2, 20000, seed++);
         run_sequence(true, 600, seed++);    // the 256-slot ring wraps twice
         run_sequence(false, 300, seed++);
+        for (bool graph : {false, true}) {
+            run_slots(false, graph, seed++);
+            run_slots(true, graph, seed++);
+        }
         run_sinks(1, 300, seed++);
         run_sinks(4, 129, seed++);
         run_norm(seed++);
