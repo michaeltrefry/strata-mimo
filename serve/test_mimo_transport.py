@@ -24,9 +24,11 @@ def out(s):
 def done(c, token=1, finish='length'):
     out(f'DONE {c} {token} 3 {c}.0 {c}0.0 {finish} 0 0 0 0 0 0 0 0 3')
 out('INFO kv_bytes=123 slots=2')
+if mode == 'affinity': out('INFO mtp=1 kv_swa_ring=256')
 out('READY 4096 stop' + ('' if mode == 'old' else ' multiplex=1 slots=2'))
 active = []
 slots = {}
+cache = {}
 for line in sys.stdin:
     p = line.split()
     if not p: continue
@@ -56,6 +58,30 @@ for line in sys.stdin:
         out(f'T {c} 65')
         out(f'INFO request_diag_v=1 command_id={c} diag_kind=timing slot={slot} native_prepared=1 live_written_end={3+c} prompt_service_ms={10*c} decode_service_ms={20*c} prompt_expert_hits={c} prompt_expert_uses={2*c} decode_expert_hits={3*c} decode_expert_uses={4*c} fresh_prompt_tokens=3 checkpoint_capture_ms=2 checkpoint_restore_ms=1 checkpoint_captures=1 checkpoint_restores=0 checkpoint_bytes=1024 checkpoint_metadata_bytes=16 checkpoint_count=1 checkpoint_boundaries=3')
         done(c)
+    elif mode == 'affinity':
+        # CPU model of native admission: live SWA safety and exact [0,c) checkpoint
+        # matching are independent. Only the boundary inventory crosses the wire.
+        prompt = tuple(map(int, p[-1].split(',')))
+        generated = int(p[3])
+        session, checkpoint, written = cache.get(slot, ((), (), 0))
+        lcp = 0
+        for old, new in zip(session, prompt):
+            if old != new: break
+            lcp += 1
+        boundary = max(0, min(len(prompt) - 1, lcp - 1))
+        resume = boundary if boundary >= written - (256 - 127) else 0
+        reason = 'retained_live' if resume else 'ring_history_missing'
+        restored = len(checkpoint) if checkpoint and prompt[:len(checkpoint)] == checkpoint else 0
+        if restored and restored - 1 > resume:
+            resume = restored - 1
+            reason = 'restored_checkpoint'
+        out(f'INFO request_diag_v=1 command_id={c} diag_kind=prefix slot={slot} raw_lcp={lcp} boundary_keep={boundary} written_end={written} resume={resume} prefix_reason={reason} checkpoint_boundary={restored} checkpoint_id={int(bool(restored))}')
+        out(f'RESUME {c} {resume}')
+        for _ in range(generated): out(f'T {c} 65')
+        written = len(prompt) + generated + 1  # MTP one-ahead watermark
+        cache[slot] = (prompt + (65,) * generated, prompt, written)
+        out(f'INFO request_diag_v=1 command_id={c} diag_kind=timing slot={slot} native_prepared=1 live_written_end={written} checkpoint_boundaries={len(prompt)}')
+        out(f'DONE {c} {generated} {len(prompt)} 1 1 length 0 0 {resume} 0 0 0 0 0 {len(prompt)-resume}')
     elif mode == 'drained':
         out(f'T {c} 65')
     elif mode == 'noprepare':
@@ -605,7 +631,32 @@ class ServiceSlots(unittest.TestCase):
             # The engine reported no reuse: a Python hint never fabricates cached tokens.
             self.assertEqual(svc.history[-1]['reused'], 0)
 
-    def test_prior_branch_checkpoint_at_lcp_plus_one_keeps_its_anchor_score(self):
+    def test_uncertain_checkpoint_cannot_displace_confirmed_live_reuse(self):
+        # Seed through real GEN/T/DONE transport, not hand-authored slot hints.
+        # Slot 0's checkpoint includes token 12 at index 299; the incoming 99
+        # cannot restore it. Slot 1 still has 298 safely reusable live tokens.
+        for available, expected_slot, expected_reuse in (([0], 0, 0), ([0, 1], 1, 298), ([1, 0], 1, 298)):
+            with self.subTest(available=available), fake_engine('affinity') as e:
+                prefix = [11] * 299
+                for slot, prompt, generated in ((0, prefix + [12], 512), (1, prefix, 8)):
+                    with e.bind_slot(slot):
+                        list(e.generate(prompt, generated, {}, threading.Event()))
+                hints = e.slot_hints()
+                self.assertEqual(hints[0]['checkpoint_boundaries'], (300,))
+                self.assertEqual(hints[0]['live_written_end'], 813)
+                self.assertEqual(hints[1]['checkpoint_boundaries'], (299,))
+                self.assertEqual(hints[1]['live_written_end'], 308)
+                svc = service(e)
+                svc._free_slots = available.copy()
+                with mock.patch.object(e, 'bind_slot', wraps=e.bind_slot) as bind:
+                    items = list(svc.run(prefix + [99], False, None, 1, {}, threading.Event()))
+                    self.assertEqual(bind.call_args.args[0], expected_slot)
+                self.assertEqual(items[-1][0], 'done')
+                self.assertEqual(svc.history[-1]['reused'], expected_reuse)
+                self.assertEqual(svc.history[-1]['prompt_read'], 300 - expected_reuse)
+                self.assertEqual(sorted(svc._free_slots), sorted(available))
+
+    def test_prior_branch_checkpoint_at_lcp_plus_one_keeps_fallback_affinity(self):
         with fake_engine('single') as e:
             e.info.update(mtp=1, kv_swa_ring=256)
             e._slot_hints = {
@@ -618,6 +669,19 @@ class ServiceSlots(unittest.TestCase):
                 list(svc.run([11, 12, 13, 14, 99], False, None, 4, {}, threading.Event()))
                 self.assertEqual(bind.call_args.args[0], 0)
             self.assertEqual(svc.history[-1]['reused'], 0)  # native validation, not this estimate, authorizes reuse
+
+    def test_checkpoint_beyond_target_end_has_no_fallback_affinity(self):
+        with fake_engine('single') as e:
+            e.info.update(mtp=1, kv_swa_ring=256)
+            e._slot_hints = {
+                0: {'generation': e._generation, 'tokens': (11, 12, 13),
+                    'checkpoint_boundaries': (4,), 'live_written_end': 200},
+                1: {'generation': e._generation, 'tokens': (11, 12, 90),
+                    'checkpoint_boundaries': (2,), 'live_written_end': 200}}
+            svc = service(e)
+            with mock.patch.object(e, 'bind_slot', wraps=e.bind_slot) as bind:
+                list(svc.run([11, 12, 13], False, None, 4, {}, threading.Event()))
+                self.assertEqual(bind.call_args.args[0], 1)
 
     def test_nearby_rewind_without_anchors_keeps_safe_live_affinity(self):
         for target in ([11, 12, 13, 14, 99], [11, 12, 13]):

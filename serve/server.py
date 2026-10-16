@@ -1610,10 +1610,13 @@ class Service:
                                 boundary = max(0, min(len(ids) - 1, count - int(mtp)))
                                 ring = info.get('kv_swa_ring', 256)
                                 live = boundary if boundary >= wm - (ring - 127) else 0
-                            # A preserved prior-branch snapshot can repair the token at the
-                            # first mismatch: score its replay anchor, not its exclusive end.
-                            anchor = max((c - 1 for c in anchors or () if c - 1 <= count), default=0)
-                            return max(live, anchor), count
+                            # Checkpoint tokens are not in the hint. A prior-branch snapshot
+                            # can retain a different boundary token, and native restore requires
+                            # all [0,c) tokens to match, even though replay starts at c-1.
+                            # Keep possible anchors as a fallback, below confirmed live reuse.
+                            anchor = max((c - 1 for c in anchors or ()
+                                          if c <= len(ids) and c - 1 <= count), default=0)
+                            return live, anchor, count
                         slot = max(self._free_slots, key=shared_prefix)
                         self._free_slots.remove(slot)
                     else:
