@@ -12,6 +12,7 @@
 
 #include "strata/mimo/attn.hpp"
 #include "strata/mimo/model.hpp"
+#include "strata/mimo/prefix_checkpoint.hpp"
 
 #include <cuda_runtime.h>
 
@@ -121,6 +122,18 @@ public:
     bool prompt_chunk(int slot, const int32_t* tokens, int n, int pos0, const ChooseFn& choose, int32_t* first,
                       int32_t* draft, const std::function<void(int)>& progress, PromptState& state, bool final,
                       std::string& err);
+    using PrefixCheckpointInfo = strata::mimo::PrefixCheckpointInfo;
+    using PrefixCheckpointStats = strata::mimo::PrefixCheckpointStats;
+    // Capture is authorized only by the engine's last completed prompt_chunk, never caller decode history.
+    // Normal eligibility/allocation/budget skips return true with captured=false. CUDA failures poison the decoder.
+    bool capture_prefix_checkpoint(int slot, int committed_end, bool prompt_end, bool& captured, std::string& err);
+    // A normal miss returns true and out.id=0. Exact tokens [0,C), including replay token C-1, must match.
+    bool find_prefix_checkpoint(int slot, const int32_t* target, int n, PrefixCheckpointInfo& out,
+                                std::string& miss_reason, std::string& err) const;
+    bool restore_prefix_checkpoint(int slot, uint64_t id, const int32_t* target, int n,
+                                   PrefixCheckpointInfo& restored, std::string& err);
+    PrefixCheckpointStats prefix_checkpoint_stats(int slot) const;
+    std::vector<int> prefix_checkpoint_boundaries(int slot) const;
     size_t kv_bytes() const {
         size_t bytes = 0;
         for (const auto& seq : sequences_) {
@@ -186,9 +199,11 @@ private:
         AttnKv mtp_kv{}, mtp2_kv{};
         cudaGraphExec_t graphs[9] = {}, mtp_graphs[9] = {};
         cudaGraphExec_t draft2_graph = nullptr;
+        detail::PrefixCheckpointPolicy checkpoints;
     };
     std::vector<std::unique_ptr<Sequence>> sequences_;   // stable KV addresses until destruction
     bool valid_slot(int slot, std::string& err) const;
+    uint64_t next_checkpoint_id_ = 1;   // decoder-global: IDs never alias a different slot or reset generation
     bool initialized_ = false;
     bool failed_ = false;                       // unsafe GPU/borrow failure: no further execution
     int hidden_slot_ = -1, mtp_hidden_slot_ = -1;

@@ -103,7 +103,7 @@ int main(int argc, char** argv) {
     std::string model_path;
     std::set<int32_t> eos = {151645, 151643};   // <|im_end|>, <|endoftext|>
     bool serve = false;
-    int prefill_quantum = 2048;
+    int prefill_quantum = 2048, decode_service_percent = 80, prefill_max_wait_ms = 250;
     std::string save_path;          // the learned profile (Strata's #477 protocol): on QUIT and every N minutes
     double save_every_min = 10;
     for (int i = 1; i < argc; ++i) {
@@ -126,6 +126,22 @@ int main(int argc, char** argv) {
             }
             if (a == "--slots") cfg.slots = (int) count;
             else prefill_quantum = (int) count;
+        }
+        else if (a == "--decode-service-percent" || a.rfind("--decode-service-percent=", 0) == 0 ||
+                 a == "--prefill-max-wait-ms" || a.rfind("--prefill-max-wait-ms=", 0) == 0) {
+            const size_t eq = a.find('=');
+            const std::string key = a.substr(0, eq);
+            if (eq == std::string::npos) val(v);
+            else v = a.substr(eq + 1);
+            uint64_t count = 0;
+            const uint64_t limit = key == "--decode-service-percent" ? 99 : 60000;
+            if (!serve_uint(v, count) || count < 1 || count > limit) {
+                std::fprintf(stderr, "strata-mimo: %s needs an integer in 1..%llu\n", key.c_str(),
+                             (unsigned long long) limit);
+                return 2;
+            }
+            if (key == "--decode-service-percent") decode_service_percent = (int) count;
+            else prefill_max_wait_ms = (int) count;
         }
         else if (a == "--budget-gib") { val(v); cfg.expert_budget_gib = std::atof(v.c_str()); }
         else if (a == "--ram-copy") {
@@ -151,7 +167,8 @@ int main(int argc, char** argv) {
     }
     if (!serve || model_path.empty()) {
         std::fprintf(stderr, "usage: %s --serve --native <model.gguf> [--mtp <mtp.gguf>] [--expert-profile <file>] "
-                             "[--max-context N] [--eos-ids a,b] [--slots 1|2] [--prefill-quantum N] [--ram-copy 0|1]\n", argv[0]);
+                             "[--max-context N] [--eos-ids a,b] [--slots 1|2] [--prefill-quantum N] [--ram-copy 0|1] "
+                             "[--decode-service-percent 1..99] [--prefill-max-wait-ms 1..60000]\n", argv[0]);
         return 2;
     }
     try {
@@ -171,7 +188,10 @@ int main(int argc, char** argv) {
             " ram_copy=" + (cfg.ram_copy ? "1" : "0"));
         if (cfg.slots == 2)
             say("INFO slots=2 context_per_slot=" + std::to_string(cfg.max_ctx) +
-                " kv_bytes=" + std::to_string(dec.kv_bytes()) + " prefill_quantum=" + std::to_string(prefill_quantum));
+                " kv_bytes=" + std::to_string(dec.kv_bytes()) + " prefill_quantum=" + std::to_string(prefill_quantum) +
+                " decode_service_percent=" + std::to_string(decode_service_percent) +
+                " prefill_max_wait_ms=" + std::to_string(prefill_max_wait_ms) + " prefix_checkpoints=1 kv_swa_ring=" +
+                std::to_string(kSwaRing));
         say("READY " + std::to_string(cfg.max_ctx) + " stop" + (cfg.slots == 2 ? " multiplex=1 slots=2" : ""));
 
         auto input_owner = std::make_shared<Input>();
@@ -197,6 +217,8 @@ int main(int argc, char** argv) {
             ServeOptions options;
             options.max_context = cfg.max_ctx;
             options.prefill_quantum = prefill_quantum;
+            options.decode_service_percent = decode_service_percent;
+            options.prefill_max_wait_ms = prefill_max_wait_ms;
             options.ring_capacity = kSwaRing;
             options.eos = eos;
             MimoServeScheduler<MimoDecoder> scheduler(dec, options, say);

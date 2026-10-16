@@ -14,6 +14,39 @@ import threading
 import time
 
 
+# These names are request-local, never process-wide INFO facts. Missing diagnostics from
+# older tagged engines stay unknown, including across reasoning-wrap commands.
+PREFIX_REASONS = frozenset(('empty_slot', 'no_common_prefix', 'boundary_replay_from_zero',
+                            'ring_history_missing', 'retained_live', 'restored_checkpoint'))
+CHECKPOINT_REASONS = frozenset(('not_needed', 'no_checkpoint', 'prefix_mismatch',
+                                'global_prefix_overwritten', 'slot_reset', 'ring_coverage',
+                                'budget', 'host_allocation', 'disabled', 'restored'))
+CHECKPOINT_SKIP_REASONS = CHECKPOINT_REASONS | frozenset(('none',))
+PREFIX_FIELDS = ('slot', 'raw_lcp', 'boundary_keep', 'written_end', 'resume', 'prefix_reason',
+                 'checkpoint_boundary', 'checkpoint_id', 'checkpoint_reason')
+SERVICE_SUM_FIELDS = ('prompt_service_ms', 'decode_service_ms', 'prompt_expert_hits',
+                      'prompt_expert_uses', 'decode_expert_hits', 'decode_expert_uses',
+                      'checkpoint_capture_ms', 'checkpoint_restore_ms', 'checkpoint_captures',
+                      'checkpoint_restores', 'fresh_prompt_tokens')
+INVENTORY_FIELDS = ('checkpoint_bytes', 'checkpoint_metadata_bytes', 'checkpoint_count',
+                    'checkpoint_boundaries')
+DIAGNOSTIC_FIELDS = (*PREFIX_FIELDS, 'command_id', 'native_prepared', 'live_written_end', 'checkpoint_skip_reason',
+                     *SERVICE_SUM_FIELDS, *INVENTORY_FIELDS)
+RATE_FIELDS = ('prompt_service_tok_per_sec', 'decode_service_tok_per_sec',
+               'prompt_hit_rate', 'decode_hit_rate')
+
+
+def service_metrics(last):
+    """Active native service rates, not elapsed request/API throughput."""
+    for phase, count in (('prompt', last.get('fresh_prompt_tokens')), ('decode', last.get('generated'))):
+        ms = last.get(phase + '_service_ms')
+        uses, hits = last.get(phase + '_expert_uses'), last.get(phase + '_expert_hits')
+        last[phase + '_service_tok_per_sec'] = count * 1000 / ms if count is not None and ms else None
+        last[phase + '_hit_rate'] = hits / uses if hits is not None and uses else None
+    last['hit_rate_scope'] = 'combined_prompt_decode'
+    return last
+
+
 class _Handle:
     def __init__(self, command, slot, limit):
         self.command, self.slot, self.limit = command, slot, limit
@@ -21,6 +54,10 @@ class _Handle:
         self.tokens = collections.deque()
         self.progress = self.prefill_tok_s_mean = None
         self.last = {}
+        self.diag = dict.fromkeys(DIAGNOSTIC_FIELDS)
+        self.input_ids = ()
+        self.native_tokens = collections.deque()
+        self.native_count = 0
         self.terminal = False
         self.error = None
         self.cancelled = False
@@ -53,12 +90,27 @@ class MultiplexEngine:
         self._pending = {}
         self._next_command = 1
         self._generation = 0
+        self._slot_hints = {}
+        self.prefill_max_wait_ms = 250
+        self.decode_service_percent = 80
         self.prefill_quantum = 2048
         for i, arg in enumerate(args):
             if arg == '--prefill-quantum' and i + 1 < len(args):
                 self.prefill_quantum = int(args[i + 1])
             elif arg.startswith('--prefill-quantum='):
                 self.prefill_quantum = int(arg.split('=', 1)[1])
+        for flag, attr, low, high in (('--prefill-max-wait-ms', 'prefill_max_wait_ms', 1, 60000),
+                                      ('--decode-service-percent', 'decode_service_percent', 1, 99)):
+            for i, arg in enumerate(args):
+                if arg == flag or arg.startswith(flag + '='):
+                    value = arg.split('=', 1)[1] if '=' in arg else args[i + 1] if i + 1 < len(args) else ''
+                    try:
+                        value = int(value)
+                    except ValueError:
+                        raise ValueError(f'{flag} needs an integer in {low}..{high}') from None
+                    if not low <= value <= high:
+                        raise ValueError(f'{flag} needs an integer in {low}..{high}')
+                    setattr(self, attr, value)
         if self.prefill_quantum <= 0:
             raise ValueError('MiMo prefill quantum must be positive')
         self._process_heard = time.monotonic()
@@ -96,8 +148,121 @@ class MultiplexEngine:
             if sep:
                 self.info[k] = int(v) if v.lstrip('-').isdigit() else v
 
+    def _request_info(self, line):
+        fields = line.split()[1:]
+        if not any(f.partition('=')[0] == 'request_diag_v' for f in fields):
+            return False
+        values = {}
+        for field in fields:
+            key, sep, value = field.partition('=')
+            if not sep or not value or key in values:
+                raise ValueError('malformed reserved request diagnostic')
+            values[key] = value
+        if values.get('request_diag_v') != '1':
+            raise ValueError('unsupported request diagnostic version')
+        command = values.get('command_id', '')
+        if not command.isdigit() or int(command) <= 0:
+            raise ValueError('diagnostic command ID must be positive')
+        command = int(command)
+        with self._registry_lock:
+            if command >= self._next_command:
+                raise ValueError('diagnostic refers to a command ID never submitted')
+            h = self._pending.get(command)
+        if h is None:
+            return True                         # issued stale IDs cannot mutate a successor
+        kind = values.get('diag_kind')
+        allowed = {'prefix': PREFIX_FIELDS, 'timing': ('native_prepared', 'live_written_end', *SERVICE_SUM_FIELDS, *INVENTORY_FIELDS),
+                   'cache': INVENTORY_FIELDS}.get(kind)
+        if allowed is None:
+            raise ValueError('unknown request diagnostic kind')
+        slot = values.get('slot', '')
+        if slot not in ('0', '1') or int(slot) != h.slot:
+            raise ValueError('diagnostic slot does not match command')
+        parsed = {'slot': int(slot), 'command_id': command}
+        for key, value in values.items():
+            if key in ('request_diag_v', 'command_id', 'diag_kind', 'slot'):
+                continue
+            if key not in allowed and key != 'checkpoint_skip_reason':
+                raise ValueError('unknown request diagnostic field: ' + key)
+            if key in ('prefix_reason', 'checkpoint_reason', 'checkpoint_skip_reason'):
+                enums = (PREFIX_REASONS if key == 'prefix_reason' else
+                         CHECKPOINT_SKIP_REASONS if key == 'checkpoint_skip_reason' else CHECKPOINT_REASONS)
+                if value not in enums:
+                    raise ValueError('unknown ' + key)
+                parsed[key] = value
+            elif key == 'checkpoint_boundaries':
+                parts = [] if value == 'none' else value.split(',')
+                if len(parts) > 8 or not all(p.isdigit() and 0 < int(p) <= self.max_context for p in parts):
+                    raise ValueError('invalid checkpoint boundaries')
+                boundaries = tuple(map(int, parts))
+                if list(boundaries) != sorted(set(boundaries)):
+                    raise ValueError('checkpoint boundaries must be sorted and unique')
+                parsed[key] = boundaries
+            elif key.endswith('_ms'):
+                number = float(value)
+                if not math.isfinite(number) or number < 0:
+                    raise ValueError('diagnostic metrics must be finite and nonnegative')
+                parsed[key] = number
+            else:
+                if not value.isdigit():
+                    raise ValueError('diagnostic count must be a nonnegative integer')
+                parsed[key] = int(value)
+                if key == 'native_prepared':
+                    if parsed[key] not in (0, 1):
+                        raise ValueError('native_prepared must be 0 or 1')
+                    parsed[key] = bool(parsed[key])
+                if key == 'checkpoint_count' and parsed[key] > 8:
+                    raise ValueError('checkpoint count exceeds bound')
+        for key in ('raw_lcp', 'boundary_keep', 'resume', 'checkpoint_boundary'):
+            if key in parsed and parsed[key] > len(h.input_ids):
+                raise ValueError('diagnostic prompt position exceeds input')
+        if any(parsed.get(key, 0) > self.max_context for key in ('written_end', 'live_written_end')):
+            raise ValueError('diagnostic write watermark exceeds context')
+        if parsed.get('prefix_reason') == 'restored_checkpoint':
+            boundary, resume, checkpoint = (parsed.get(k) for k in ('checkpoint_boundary', 'resume', 'checkpoint_id'))
+            if boundary is not None and resume is not None and resume != boundary - 1:
+                raise ValueError('restored checkpoint resume must replay its boundary token')
+            if checkpoint is not None and checkpoint <= 0:
+                raise ValueError('restored checkpoint needs a positive checkpoint ID')
+        with h.cv:
+            h.diag.update(parsed)
+            for phase in ('prompt', 'decode'):
+                hits, uses = h.diag[phase + '_expert_hits'], h.diag[phase + '_expert_uses']
+                if hits is not None and uses is not None and hits > uses:
+                    raise ValueError('expert hits exceed uses')
+            h.heard = self._process_heard = time.monotonic()
+            h.cv.notify_all()
+        return True
+
+    def slot_hints(self):
+        """Immutable, terminal-confirmed estimates; native exact validation is authoritative."""
+        with self._registry_lock:
+            return {slot: dict(hint) for slot, hint in self._slot_hints.items()
+                    if hint['generation'] == self._generation}
+
+    def _confirm_hint(self, h):
+        if h.error is not None or h.last.get('finish') == 'error':
+            self._slot_hints.pop(h.slot, None)
+            return
+        if h.diag['native_prepared'] == 0:
+            return                              # cancelled before any native state was touched
+        if h.native_count != h.last.get('generated'):
+            self._slot_hints.pop(h.slot, None)
+            return                              # uncertain journal, never guess accepted drafts
+        read = h.last.get('prompt_read')
+        if read is None:
+            self._slot_hints.pop(h.slot, None)
+            return                              # old DONE groups cannot confirm a partial prompt
+        end = min(len(h.input_ids), (h.last.get('reused') or 0) + read)
+        tokens = (h.input_ids[:end] + tuple(h.native_tokens))[:self.max_context]
+        self._slot_hints[h.slot] = {'generation': self._generation, 'command_id': h.command,
+                                   'tokens': tokens,
+                                   'checkpoint_boundaries': h.diag['checkpoint_boundaries'],
+                                   'live_written_end': h.diag['live_written_end']}
+
     def restart(self):
         self.close()
+        self.silent_note = None
         exe, args, cwd, log, env = self.spawn
         self.ended, self.unloaded = True, False
         self._generation += 1
@@ -113,7 +278,8 @@ class MultiplexEngine:
             contain(proc)
             for line in proc.stdout:
                 if line.startswith('INFO '):
-                    self._info(line)
+                    if not self._request_info(line):
+                        self._info(line)
                 elif line.startswith('READY '):
                     f = line.split()
                     if not {'stop', 'multiplex=1', 'slots=2'}.issubset(f[2:]):
@@ -147,6 +313,7 @@ class MultiplexEngine:
             self.ended = True
             handles = list(self._pending.values())
             self._pending.clear()
+            self._slot_hints.clear()
         for h in handles:
             with h.cv:
                 h.error = self.failure_type(message)
@@ -205,6 +372,7 @@ class MultiplexEngine:
         with self._registry_lock:
             if self.proc is not proc or generation != self._generation:
                 return
+            self.silent_note = 'The engine was stopped for an invalid protocol record: ' + message
             try:
                 proc.kill()
             except OSError:
@@ -216,7 +384,8 @@ class MultiplexEngine:
             for line in proc.stdout:
                 if line.startswith('INFO '):
                     if self.proc is proc and generation == self._generation:
-                        self._info(line)
+                        if not self._request_info(line):
+                            self._info(line)
                     continue
                 if not line.strip():
                     continue
@@ -240,6 +409,9 @@ class MultiplexEngine:
                 with h.cv:
                     h.heard = self._process_heard = time.monotonic()
                     if kind == 'T':
+                        h.native_count += 1
+                        if len(h.native_tokens) < self.max_context:
+                            h.native_tokens.append(int(payload))
                         if not h.cancelled:
                             if len(h.tokens) >= h.limit:
                                 h.error = ValueError('MiMo token queue overflow: this request was cancelled (slow consumer)')
@@ -254,10 +426,14 @@ class MultiplexEngine:
                     elif kind == 'DONE':
                         result = type('DoneResult', (), {})()
                         self._parse_done_into(result, 'DONE ' + payload)
-                        h.last = result.last
+                        h.last = service_metrics(dict(result.last, **h.diag))
+                        with self._registry_lock:
+                            self._confirm_hint(h)
                         h.terminal = True
                     elif kind == 'ERR':
                         h.error = ValueError(payload)
+                        with self._registry_lock:
+                            self._slot_hints.pop(h.slot, None)
                         h.terminal = True
                     h.cv.notify_all()
                 if overflow:
@@ -293,7 +469,9 @@ class MultiplexEngine:
             rate = h.prefill_tok_s_mean
             allowances.append(max(quantum_s, 3.0 * self.prefill_quantum / rate) if rate else quantum_s)
         # Retain an allowance for a peer that just completed and left the registry.
-        return sum(sorted(allowances, reverse=True)[:self.capacity]) + max(0, self.capacity - len(allowances)) * quantum_s
+        return (sum(sorted(allowances, reverse=True)[:self.capacity]) +
+                max(0, self.capacity - len(allowances)) * quantum_s +
+                self.prefill_max_wait_ms / 1000.0)
 
     def _request_deadline(self, h, handles):
         budget = float(self.silence_s or 0) + self._round_allowance(handles)
@@ -338,6 +516,8 @@ class MultiplexEngine:
             command = self._next_command
             self._next_command += 1
             h = _Handle(command, slot, self.token_queue_limit)
+            h.input_ids = tuple(int(t) for t in ids)[:self.max_context]
+            h.diag.update(command_id=command, slot=slot)
             h.on_failure = getattr(self._local, 'on_failure', None)
             self._pending[command] = h
             self._local.handle = h
@@ -383,6 +563,22 @@ class MultiplexEngine:
                                     'hits', 'lookups', 'ram_blobs', 'file_blobs', 'file_mb', 'prompt_read'):
                             if key in previous or key in last:
                                 last[key] = previous.get(key, 0) + last.get(key, 0)
+                        for key in SERVICE_SUM_FIELDS:
+                            a, b = previous.get(key), last.get(key)
+                            last[key] = a + b if a is not None and b is not None else None
+                        decisions = (*PREFIX_FIELDS, 'command_id', 'native_prepared')
+                        first = previous.get('prefix_decisions', ({k: previous.get(k) for k in decisions},))
+                        last['prefix_decisions'] = (*first, {k: last.get(k) for k in decisions})
+                        prepared = previous.get('native_prepared'), last.get('native_prepared')
+                        last['native_prepared'] = 1 if 1 in prepared else None if None in prepared else 0
+                        # The top-level decision belongs to the original prompt. Later wrap
+                        # decisions remain separate rather than claiming one prefix explained all work.
+                        for key in PREFIX_FIELDS:
+                            last[key] = previous.get(key)
+                        last['command_ids'] = (*previous.get('command_ids', (previous.get('command_id'),)),
+                                               last.get('command_id'))
+                        last['command_id'] = previous.get('command_id')
+                        service_metrics(last)
                         # Cache accounting is for the client's original prompt, not our injected wrap-up.
                         last['reused'] = previous.get('reused', 0)
                         last['prompt_tokens'] = previous.get('prompt_tokens', last.get('prompt_tokens'))
@@ -398,7 +594,8 @@ class MultiplexEngine:
             with h.cv:
                 result[h.slot] = {"command_id": h.command, "progress": h.progress,
                                   "prefill_tok_s_mean": h.prefill_tok_s_mean,
-                                  "draining": h.cancelled and not h.terminal}
+                                  "draining": h.cancelled and not h.terminal,
+                                  **service_metrics(dict(h.diag, generated=h.native_count))}
         return result
 
     def wait_slot(self, slot):

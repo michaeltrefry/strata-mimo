@@ -650,7 +650,7 @@ class StrataEngine:
                 self.progress, self.last = None, {}
 
 
-from serve.mimo_transport import MultiplexEngine
+from serve.mimo_transport import MultiplexEngine, DIAGNOSTIC_FIELDS, RATE_FIELDS
 
 
 class MiMoEngine(MultiplexEngine, StrataEngine):
@@ -1012,7 +1012,6 @@ class Service:
         self.max_queued_requests = 32                  # two-slot admission is bounded as well as token buffering
         self._active_slots = {}
         self._slot_rates = {}
-        self._slot_prefixes = {}                       # affinity hints only; native validates actual KV reuse
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
         # #321: browser pages of these origins may call /v1/* (CORS; "*" = any page - only with an api_key that
@@ -1590,17 +1589,33 @@ class Service:
             while slot is None and not cancel.is_set():
                 with self._slot_cv:
                     if self._free_slots:
+                        hints = self.engine.slot_hints() if hasattr(self.engine, 'slot_hints') else {}
                         def shared_prefix(candidate):
-                            cached = self._slot_prefixes.get(candidate, ())
+                            hint = hints.get(candidate, {})
+                            cached = hint.get('tokens', ())
                             count = 0
                             for old, new in zip(cached, ids):
                                 if old != new:
                                     break
                                 count += 1
-                            return count
+                            anchors = hint.get('checkpoint_boundaries')
+                            # Nearby rewinds can still be in the live SWA ring even when no
+                            # checkpoint exists. Missing old-engine watermarks retain the LCP
+                            # heuristic; neither estimate can authorize native KV reuse.
+                            wm = hint.get('live_written_end')
+                            live = count
+                            if wm is not None:
+                                info = getattr(self.engine, 'info', {}) or {}
+                                mtp = str(info.get('mtp', 0)) not in ('0', '', 'None', 'False')
+                                boundary = max(0, min(len(ids) - 1, count - int(mtp)))
+                                ring = info.get('kv_swa_ring', 256)
+                                live = boundary if boundary >= wm - (ring - 127) else 0
+                            # A preserved prior-branch snapshot can repair the token at the
+                            # first mismatch: score its replay anchor, not its exclusive end.
+                            anchor = max((c - 1 for c in anchors or () if c - 1 <= count), default=0)
+                            return max(live, anchor), count
                         slot = max(self._free_slots, key=shared_prefix)
                         self._free_slots.remove(slot)
-                        self._slot_prefixes[slot] = tuple(ids)
                     else:
                         self._slot_cv.wait(0.1)
                 if slot is None and time.monotonic() - last_ping >= 10:
@@ -1800,7 +1815,9 @@ class Service:
                                 "file_blobs": last.get("file_blobs"), "file_mb": last.get("file_mb"),
                                 # #457: the speculative drafts from the DONE line (None: the engine did not say)
                                 "drafts_offered": last.get("drafts_offered"),
-                                "drafts_accepted": last.get("drafts_accepted")})
+                                "drafts_accepted": last.get("drafts_accepted"),
+                                **{key: last.get(key) for key in (*DIAGNOSTIC_FIELDS, *RATE_FIELDS,
+                                      'hit_rate_scope', 'prefix_decisions', 'command_ids')}})
                             t = self.totals
                             t["requests"] += 1
                             t["prompt_tokens"] += seen

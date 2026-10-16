@@ -222,6 +222,121 @@ void reprompt_regressions(MimoDecoder& dec, bool graph) {
     }
 }
 
+// The reference and restored runs start from the SAME captured main-window trace. In particular, never
+// substitute a fresh T=2 prompt for an old T=3 accepted window (the controlled regression above explains why).
+void checkpoint_regressions(MimoDecoder& dec, bool graph) {
+    std::string err, miss;
+    constexpr int C = 300, A = C - 1;
+    std::vector<int32_t> old(600), target;
+    for (size_t i = 0; i < old.size(); ++i) old[i] = 32 + (int) ((i * 37 + 29) % 200);
+    target.assign(old.begin(), old.begin() + C);
+    for (int i = C; i < 333; ++i) target.push_back(32 + (i * 17 + 113) % 200);
+    require(target[C] != old[C], "checkpoint fixture must replace saved MTP lookahead at C");
+    require(dec.reset_sequence(0, err), "checkpoint reset: " + err);
+    auto prime = [&](int end) {
+        MimoDecoder::PromptState state;
+        for (int cursor = 0; cursor < end;) {
+            const int n = std::min(137, end - cursor);
+            const bool final = cursor + n == end;
+            int32_t first = 0, draft = 0;
+            auto choose = [&](const float*, int32_t) { return old[(size_t) cursor + n]; };
+            require(dec.prompt_chunk(0, old.data() + cursor, n, cursor, choose, &first, &draft,
+                                     nullptr, state, final, err), "checkpoint prime: " + err);
+            cursor += n;
+        }
+    };
+    prime(350);  // leave actual older future writes in every cache; C is NOT the written watermark
+    prime(C);
+    bool captured = false;
+    require(dec.capture_prefix_checkpoint(0, C, true, captured, err) && captured, "checkpoint capture: " + err);
+    MimoDecoder::PrefixCheckpointInfo checkpoint;
+    require(dec.find_prefix_checkpoint(0, target.data(), (int) target.size(), checkpoint, miss, err) && checkpoint.id,
+            "checkpoint lookup: " + err + " " + miss);
+    require(checkpoint.committed_end == C && checkpoint.replay_pos == A && checkpoint.main_written_end == 350 &&
+            checkpoint.mtp_written_end == 351 && (!dec.has_mtp2() || checkpoint.mtp2_written_end == 351),
+            "capture must preserve actual older-future write watermarks");
+    const auto usage = dec.prefix_checkpoint_stats(0);
+    require(usage.count == 1 && usage.payload_bytes == checkpoint.host_bytes && checkpoint.metadata_bytes >= C * sizeof(int32_t),
+            "checkpoint byte gauges must include snapshot payload and exact prefix allocation");
+    require(usage.payload_bytes + usage.metadata_bytes + dec.prefix_checkpoint_stats(1).payload_bytes +
+            dec.prefix_checkpoint_stats(1).metadata_bytes <= (size_t(512) << 20), "aggregate checkpoint budget exceeded");
+
+    // Baseline replay, including the NEW token at C, repairs the saved MTP lookahead before comparison.
+    MimoDecoder::PromptState reference_state;
+    Result reference;
+    prompt_range(dec, 0, target, A, (int) target.size(), true, reference_state, reference);
+    require(dec.prefix_checkpoint_stats(0).count == 1, "self-anchor replay must preserve its checkpoint");
+    Sequence reference_tail(0, 19);
+    reference_tail.pos = (int) target.size();
+    reference_tail.result = reference;
+    reference_tail.decode_step(dec, 0);
+    reference_tail.decode_step(dec, 0);
+    const Result reference_continuation = reference_tail.result;
+    for (int i = 0; i < 140; ++i) reference_tail.decode_step(dec, 0);  // >256 actual positions, not merely requests
+    require(reference_tail.pos - (int) target.size() > 256, "checkpoint regression must age out the live ring");
+    require(dec.capture_prefix_checkpoint(0, reference_tail.pos, true, captured, err) && !captured,
+            "caller-claimed decode prefix must not authorize a snapshot");
+    // Handles and exact identity are checked AGAIN at restore. Every failure below must precede all GPU writes
+    // and must leave the decoder usable for the later legitimate restore.
+    MimoDecoder::PrefixCheckpointInfo restored;
+    require(!dec.restore_prefix_checkpoint(1, checkpoint.id, target.data(), (int) target.size(), restored, err),
+            "wrong-slot checkpoint restore must fail");
+    require(!dec.restore_prefix_checkpoint(0, checkpoint.id + 100000, target.data(), (int) target.size(), restored, err),
+            "unknown checkpoint restore must fail");
+    auto mismatch = target;
+    mismatch[A] ^= 1;
+    MimoDecoder::PrefixCheckpointInfo absent;
+    require(dec.find_prefix_checkpoint(0, mismatch.data(), (int) mismatch.size(), absent, miss, err) && !absent.id &&
+            miss == "prefix_mismatch", "exact anchor mismatch must be a normal lookup miss");
+    require(!dec.restore_prefix_checkpoint(0, checkpoint.id, mismatch.data(), (int) mismatch.size(), restored, err),
+            "restore must recheck the anchor token rather than trusting a previous lookup");
+    require(dec.reset_sequence(1, err), "checkpoint peer reset: " + err);
+    Sequence peer(281, 7);
+    while (!peer.prompted()) peer.prompt_step(dec, 1);
+    require(dec.restore_prefix_checkpoint(0, checkpoint.id, target.data(), (int) target.size(), restored, err),
+            "checkpoint restore after ring aging/peer reset: " + err);
+    require(restored.main_written_end == 350 && restored.mtp_written_end == 351 &&
+            restored.mtp2_written_end == checkpoint.mtp2_written_end, "restored watermark must not use current live maxima");
+    int32_t next = 0;
+    require(!dec.mtp_forward(0, target.data() + C, 1, C, &next, err), "restore must invalidate shared hidden ownership");
+    require(dec.capture_prefix_checkpoint(0, C, true, captured, err) && !captured,
+            "restore alone must not reestablish prompt capture eligibility");
+    MimoDecoder::PromptState replay_state;
+    Result replay;
+    prompt_range(dec, 0, target, A, (int) target.size(), true, replay_state, replay);
+    compare_diagnostic(reference, replay, "checkpoint graph=" + std::to_string(graph) + " aged-ring restore/MTP lookahead");
+    Sequence replay_tail(0, 19);
+    replay_tail.pos = (int) target.size();
+    replay_tail.result = replay;
+    replay_tail.decode_step(dec, 0);
+    replay_tail.decode_step(dec, 0);
+    compare(reference_continuation, replay_tail.result, "checkpoint restored continuation");
+
+    // Restore and replay the very same suffix once more: graphs continue to bind unchanged cache addresses.
+    require(dec.restore_prefix_checkpoint(0, checkpoint.id, target.data(), (int) target.size(), restored, err),
+            "repeat checkpoint restore: " + err);
+    MimoDecoder::PromptState repeated_state;
+    Result repeated;
+    prompt_range(dec, 0, target, A, (int) target.size(), true, repeated_state, repeated);
+    compare(reference, repeated, "repeated checkpoint restore");
+    int32_t rewritten = old[A - 1];
+    require(dec.forward(0, &rewritten, 1, A - 1, &next, nullptr, err), "identical-token rewrite: " + err);
+    require(!dec.restore_prefix_checkpoint(0, checkpoint.id, target.data(), (int) target.size(), restored, err),
+            "even an identical earlier main write must invalidate protected global KV");
+    require(dec.prefix_checkpoint_stats(0).count == 0, "invalidated checkpoint payload must be released");
+    // Reset destroys generation handles too, while lifetime counters remain usable for request deltas.
+    prime(C);
+    require(dec.capture_prefix_checkpoint(0, C, true, captured, err) && captured, "new generation capture: " + err);
+    require(dec.find_prefix_checkpoint(0, target.data(), (int) target.size(), checkpoint, miss, err) && checkpoint.id,
+            "new checkpoint lookup: " + err);
+    const auto before_reset = dec.prefix_checkpoint_stats(0);
+    require(dec.reset_sequence(0, err), "checkpoint generation reset: " + err);
+    require(!dec.restore_prefix_checkpoint(0, checkpoint.id, target.data(), (int) target.size(), restored, err),
+            "reset-generation handle must never restore");
+    require(dec.prefix_checkpoint_stats(0).captures == before_reset.captures && dec.prefix_checkpoint_stats(0).count == 0,
+            "reset must preserve lifetime counters but clear retained checkpoint gauges");
+}
+
 Result isolated(MimoDecoder& dec, int seed, int n) {
     std::string err;
     require(dec.reset_sequence(0, err), "reset baseline: " + err);
@@ -270,6 +385,7 @@ std::vector<Result> exercise(MimoModel& model, DecoderConfig cfg) {
     compare(continued_a, rebuilt.result, "peer prompt/decode preserves A continuation");
     require(dec.kv_bytes() > 0, "missing cache byte accounting");
     reprompt_regressions(dec, cfg.graph);
+    checkpoint_regressions(dec, cfg.graph);
     std::printf("PASS graph=%d, batched=%d, two slots, main/MTP, rewind, chunking, retained prefix and recycling\n",
                 cfg.graph, cfg.batched_prefill);
     return {a, b};
