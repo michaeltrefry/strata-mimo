@@ -1,25 +1,38 @@
-"""Drive a loaded, isolated two-slot MiMo HTTP server; never starts/stops a model.
+"""Plan a two-slot MiMo smoke campaign; no network unless --run is explicit.
 
-    python tools/mimo/serve_slots_smoke.py --base-url http://127.0.0.1:8096 --case all
+    python tools/mimo/serve_slots_smoke.py --case long-prefix
+    python tools/mimo/serve_slots_smoke.py --run --base-url http://127.0.0.1:8096 --case all
 
-Uses the public OpenAI-compatible API. Reports wall latency and overlap, not GPU service time.
-The caller must choose the test instance, not a production endpoint. No third-party packages.
+--run requires an isolated, loaded loopback test server, never production. Does not
+start, stop, reload or configure a model. 'all' retains the five short cases; heavy
+long-prefix/matched campaigns are separately opt-in. Stream gaps measure TEXT
+updates, not native token ITL. No third-party packages.
 """
 from __future__ import annotations
 
 import argparse
 import concurrent.futures
 import json
+from pathlib import Path
+import sys
 import threading
+import uuid
 import time
 import urllib.parse
 import urllib.request
+
+if __package__:
+    from . import long_turn_smoke as long_turn
+else:
+    # Direct and isolated (-I) invocations may only import this trusted script directory.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import long_turn_smoke as long_turn
 
 
 def fetch(base, path, payload=None):
     data = json.dumps(payload).encode() if payload is not None else None
     request = urllib.request.Request(base + path, data=data, headers={"Content-Type": "application/json"})
-    return urllib.request.urlopen(request, timeout=600)
+    return long_turn.open_local(request, timeout=600)
 
 
 def request(base, model, name, prompt, barrier=None, streaming=True, cancel_after=None, started=None):
@@ -164,39 +177,78 @@ def queued_cancel(base, model):
         return [a.result(timeout=600), b.result(timeout=600)]
 
 
-def main():
+def main(argv=None, client_factory=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base-url", required=True)
-    parser.add_argument("--case", choices=("overlap", "cancel", "mixed", "prefill", "queue", "all"), default="overlap")
-    args = parser.parse_args()
+    parser.add_argument("--base-url", default="http://127.0.0.1:8096")
+    parser.add_argument("--case", choices=("overlap", "cancel", "mixed", "prefill", "queue", "all",
+                                          "long-prefix", "matched"), default="overlap")
+    parser.add_argument("--run", action="store_true", help="explicitly enable HTTP/inference on the chosen server")
+    parser.add_argument("--allow-busy", action="store_true", help="override initial busy refusal; does not disable evidence checks")
+    parser.add_argument("--output", type=Path, help="new JSON artifact; existing paths are never overwritten")
+    parser.add_argument("--target-tokens", type=int, nargs="+", choices=long_turn.TARGETS, default=list(long_turn.TARGETS))
+    parser.add_argument("--output-tokens", type=int, default=1024, help="long cases only; >=512 requested, >256 actually generated")
+    parser.add_argument("--repetitions", type=int, default=3, help="matched warmup/solo/competing repetitions; >=2")
+    parser.add_argument("--max-text-gap-s", type=float, default=10.0, help="mixed-case streamed-text stall limit, NOT token ITL")
+    parser.add_argument("--scheduler-label", default="unspecified", help="evidence label only; never changes server configuration")
+    args = parser.parse_args(argv)
     base = args.base_url.rstrip("/")
-    if urllib.parse.urlsplit(base).hostname not in ("127.0.0.1", "localhost", "::1"):
-        parser.error("use an explicitly chosen loopback test server")
-    with fetch(base, "/slots") as response:
-        slots = json.load(response)
-    if not isinstance(slots, list) or len(slots) != 2:
-        raise AssertionError(f"test server does not advertise two slots: {slots}")
-    with fetch(base, "/v1/models") as response:
-        model = json.load(response)["data"][0]["id"]
-    cases = ("overlap", "mixed", "cancel", "prefill", "queue") if args.case == "all" else (args.case,)
-    reports = []
-    for case in cases:
-        if case == "prefill":
-            results = prefill(base, model)
-        elif case == "queue":
-            results = queued_cancel(base, model)
-        else:
-            results = pair(base, model, case)
-        wall = max(r["ended"] for r in results) - min(r["began"] for r in results)
-        count = sum((r["usage"] or {}).get("completion_tokens", 0) for r in results)
-        summary = {"case": case, "passed": True, "wall_s": round(wall, 3),
-                   "completed_output_tokens": count,
-                   "aggregate_completed_tok_s": round(count / wall, 2) if count and wall else None}
-        reports.append({**summary, "requests": results})
-        print(json.dumps({**summary,
-                          "requests": [{k: v for k, v in r.items() if k not in ("content", "reasoning", "began", "first", "ended", "updates")}
-                                       for r in results]}, ensure_ascii=False), flush=True)
-    print(json.dumps({"passed": True, "model": model, "results": reports}, ensure_ascii=False), flush=True)
+    url = urllib.parse.urlsplit(base)
+    if (url.scheme not in ("http", "https") or url.hostname not in ("127.0.0.1", "localhost", "::1")
+            or url.username or url.password or url.path or url.query or url.fragment):
+        parser.error("use an explicitly chosen loopback test server origin without credentials/path/query")
+    if args.output_tokens < 512 or args.repetitions < 2 or not long_turn.number(args.max_text_gap_s) or args.max_text_gap_s <= 0:
+        parser.error("require output-tokens >=512, repetitions >=2 and a finite positive text-gap limit")
+    plan = {"case": args.case, "base_url": base, "run": args.run,
+            "scheduler_label": args.scheduler_label, "allow_busy_override": args.allow_busy,
+            "repetitions": args.repetitions, "max_streamed_text_gap_s": args.max_text_gap_s,
+            "scenario_plan": long_turn.plan_scenarios(args.target_tokens, args.output_tokens)}
+    if not args.run:
+        print(json.dumps({"dry_run": True, "network_contacted": False, **plan}, indent=2))
+        return 0
+    output_path = args.output or Path(f"mimo-smoke-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:12]}.json")
+    # Reserve artifact BEFORE even status HTTP; a typo cannot overwrite evidence.
+    with output_path.open("x", encoding="utf-8") as artifact:
+        report = {**plan, "passed": False, "performance_validated": False}
+        try:
+            client = (client_factory or long_turn.Client)(base)
+            if args.case == "long-prefix":
+                report.update(long_turn.run_long_prefix(client, targets=args.target_tokens,
+                                                       output_tokens=args.output_tokens, allow_busy=args.allow_busy, evidence=report))
+            elif args.case == "matched":
+                report.update(long_turn.run_matched(client, output_tokens=args.output_tokens,
+                                                   repetitions=args.repetitions, allow_busy=args.allow_busy,
+                                                   max_text_gap_s=args.max_text_gap_s, evidence=report))
+            else:
+                initial = long_turn.prepare_run(client, args.allow_busy)
+                model = initial["engine"]["model"]
+                cases = ("overlap", "mixed", "cancel", "prefill", "queue") if args.case == "all" else (args.case,)
+                reports = []
+                report.update(initial=initial, results=reports)
+                for case in cases:
+                    if not args.allow_busy and not long_turn.idle(client.metrics()):
+                        raise RuntimeError("concurrent client detected before short case")
+                    if case == "prefill":
+                        results = prefill(base, model)
+                    elif case == "queue":
+                        results = queued_cancel(base, model)
+                    else:
+                        results = pair(base, model, case)
+                    wall = max(r["ended"] for r in results) - min(r["began"] for r in results)
+                    count = sum((r["usage"] or {}).get("completion_tokens", 0) for r in results)
+                    reports.append({"case": case, "passed": True, "wall_s": round(wall, 3),
+                                    "completed_output_tokens": count,
+                                    "aggregate_completed_tok_s": round(count / wall, 2) if count and wall else None,
+                                    "requests": results})
+                report["after"] = long_turn.settled(client)
+            report["passed"] = True
+        except Exception as error:
+            report["error"] = f"{type(error).__name__}: {error}"
+            raise
+        finally:
+            json.dump(report, artifact, indent=2, ensure_ascii=False)
+            artifact.write("\n")
+    print(json.dumps({"passed": True, "performance_validated": False, "output": str(output_path)}))
+    return 0
 
 
 if __name__ == "__main__":

@@ -241,6 +241,8 @@ bool MimoDecoder::prompt_batched(int slot, const int32_t* tokens, int n, int pos
     for (int done = 0; done < n;) {
         const int S = std::min(cfg_.prefill_slice, n - done), base = pos0 + done;
         const bool last_slice = done + S == n;
+        auto& checkpoint_policy = sequences_[(size_t) slot]->checkpoints;
+        checkpoint_policy.before_main(base, S);  // invalidate protected global prefixes BEFORE any layer writes
         if (!ok(cudaMemcpyAsync(pTok_, tokens + done, sizeof(int32_t) * S, cudaMemcpyHostToDevice, s), "tokens", err))
             return false;
         embed_q8_0(model_.token_embd().data, pTok_, pX_, S, E, s);
@@ -310,6 +312,7 @@ bool MimoDecoder::prompt_batched(int slot, const int32_t* tokens, int n, int pos
         // decode reads the window's final hidden state from x_: leave the slice's last position there
         if (!ok(cudaMemcpyAsync(x_, xl, sizeof(float) * E, cudaMemcpyDeviceToDevice, s), "prompt transfer", err)) return false;
         if (has_mtp()) {   // the MTP layers over positions base + 1 .. base + S: token p with the state at p - 1
+            checkpoint_policy.before_mtp(base + S + 1, has_mtp2());
             std::vector<int32_t> mt((size_t) S);
             for (int j = 0; j < S; ++j) mt[(size_t) j] = done + j + 1 < n ? tokens[done + j + 1] : *first;
             if (!ok(cudaMemcpyAsync(pTok_, mt.data(), sizeof(int32_t) * S, cudaMemcpyHostToDevice, s), "prompt transfer", err)) return false;
@@ -348,6 +351,7 @@ bool MimoDecoder::prompt_batched(int slot, const int32_t* tokens, int n, int pos
         }
         if (!ok(cudaGetLastError(), "prompt kernels", err) ||
             !ok(cudaStreamSynchronize(s), "prompt slice", err)) return false;
+        checkpoint_policy.after_main(tokens + done, base, S);
         done += S;
     }
     if (usage_.empty()) usage_.assign((size_t) g.n_layer * g.n_expert, 0.0);

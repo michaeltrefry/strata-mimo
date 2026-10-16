@@ -99,8 +99,9 @@ request formats do not change.
 Both requests keep their own KV cache in VRAM, token history, sampler and MTP draft state. They share one model,
 one expert cache, one pinned RAM copy and one compute workspace. The engine alternates complete generation steps;
 it does not execute two GPU forwards at once, and this is not a claim of doubled throughput. A third request waits
-for a free slot (at most 32 waiting requests; further requests receive a queue-full error). Idle slots prefer the
-longest matching previous prompt as an affinity hint; the engine validates actual reuse. Canceling one request
+for a free slot (at most 32 waiting requests; further requests receive a queue-full error). Idle-slot affinity uses
+terminal-confirmed prompt/output tokens and estimated live-ring/checkpoint availability; the engine still validates
+exact reuse. A matching occupied slot does not indefinitely block another free slot. Canceling one request
 does not cancel the other. A client that stops consuming output is canceled if its bounded token queue fills,
 so it cannot block the other client's stream.
 
@@ -122,10 +123,25 @@ In two-slot mode, prompt processing also yields after complete chunks, even if t
 yet. Native `--prefill-quantum N` (in the config's `args`) sets the bulk chunk ceiling; the default is 2,048 tokens.
 While a peer is generating, prompt turns use at most 8 tokens; at the default `--batched-min 128`, these use the
 decode-window path instead, avoiding bulk expert-copy/refill pauses in the live stream. Bulk chunks resume when
-that peer finishes. Prompt throughput
-while sharing with a live stream can be lower; the trade-off is response latency. The engine finishes the whole
-chunk and its MTP work before switching. The chunk size is not a fixed latency guarantee. One-slot mode retains
-the existing bulk prompt path.
+that peer finishes. When prefill competes with generation, scheduling targets 80% of measured compute-owner
+service for decoding, not an equal number of unequal turns. Native `--decode-service-percent` (1–99, default 80)
+and `--prefill-max-wait-ms` (1–60000, default 250) in the config's `args` tune this policy. An overdue prefill turn
+wins even if that reduces the achieved decode share. Its wait bound includes the current nonpreemptible main/MTP
+operation; this is not a hard real-time or token-rate guarantee. Two prefills or two decoders still alternate.
+Prompt throughput while sharing can be lower. One-slot mode retains the existing bulk prompt path.
+
+Long-turn reuse also keeps bounded checkpoints of the rolling SWA/MTP rings in ordinary system RAM. The large
+global-attention KV stays in VRAM. Each slot retains a prompt-end checkpoint and geometric prompt milestones, at
+most eight entries, under a 512 MiB combined native checkpoint budget. A checkpoint restores only when its exact
+prefix and required global KV are still valid; otherwise the engine safely reads the missing prefix again. This is
+not full-KV RAM swapping or arbitrary conversation storage. [Checkpoint and diagnostic details](MIMO_DECODER.md#long-turn-throughput-follow-up).
+
+[Long-turn GPU validation](MIMO_DECODER.md#long-turn-gpu-validation-2026-10-16) passed checkpoint parity and repeated
+25K–100K assistant/tool turns. Exact repeats processed one token instead of the full prefix. In two repetitions per
+policy, a warmed 77K decoder beside a fresh 28K prefill delivered a median 32.4 tok/s with service weighting versus
+11.6 tok/s with a round-robin control using the same decoder/checkpoints. These isolated GPU 1 measurements used a
+64 GiB expert budget and mapped CPU experts; they are not a prediction of production tok/s or a full old-release
+comparison. The earlier short-request measurements alone did not validate these workloads.
 
 For validation beside another installation, native `--ram-copy 0` reads CPU experts from the existing GGUF mapping
 instead of allocating another pinned ~150 GiB copy. The default is `--ram-copy 1`; the mapped path is not the

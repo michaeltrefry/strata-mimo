@@ -152,9 +152,10 @@ adaptation runs at completion. Repeated borrow/refill is deliberately retained i
 Prefix reuse is slot-local. With MTP it replays the token before the first unvalidated token as well: that main
 hidden row is needed to replace MTP's one-ahead entry at a divergent suffix or extension boundary. The two-slot
 scheduler also accounts for writes beyond the accepted session from speculation and MTP. If required
-sliding-window history is no longer in the ring, it reprocesses from position zero;
-replaying only a short suffix would itself need older keys that are no longer present. A fresh reset clears the
-small rings; a retained-prefix continuation does not clear the MTP history it still needs.
+sliding-window history is no longer in the live ring, it first looks for a valid slot-local host checkpoint. With
+no eligible checkpoint it reprocesses from position zero: replaying an arbitrary short suffix would itself need
+older keys that are no longer present. A fresh reset clears the small rings and invalidates their checkpoints;
+a retained-prefix continuation does not clear the MTP history it still needs.
 
 `mimo_serve_test` checks the production scheduler against a CPU fake, without a model or GPU. The attention tests
 also compare two independent KV sets using shared scratch and slot-bound graph replay against the CPU reference.
@@ -162,7 +163,8 @@ The model-required `mimo_decoder_slots_test` compares fixed-input logits and dra
 alternating calls, including divergent/extended/canceled prompt-prefix reuse. Its arguments are the main GGUF,
 MTP GGUF, optional expert profile, optional expert budget in GiB, and optional MTP head count (1 or 2). It reads CPU
 experts from the existing GGUF mapping rather than allocating a second pinned ~150 GiB copy for validation.
-Validated 2026-10-15 on GPU 1 of the same RTX PRO 6000 Blackwell Max-Q PC: synthetic attention/shared-scratch
+The original slot suite, before the checkpoint/service-budget follow-up, was validated 2026-10-15 on GPU 1 of the
+same RTX PRO 6000 Blackwell Max-Q PC: synthetic attention/shared-scratch
 isolation passed both direct and captured-graph execution; fused kernels remained bitwise equal. The full-model
 slot harness passed graph off, graph on and batched prefill with MTP enabled, 1,024 positions per slot, a 64 GiB
 expert budget and mapped CPU experts. Controlled divergent/extended/canceled-prefix comparisons reported zero
@@ -170,6 +172,128 @@ maximum absolute logit error and matching MTP drafts. Their retained and fresh r
 window widths, rather than conflating window-width numerical differences with cache isolation.
 
 These are correctness checks. Separate HTTP validation timings follow.
+
+### Long-turn throughput follow-up
+
+**Status:** CPU/build checks, new real-model checkpoint parity and the 25K/50K/77K/100K multi-turn reuse campaign
+have passed. The repeated 77K decode / fresh 28K prefill observations below are current-policy evidence; a separate
+round-robin control is needed to isolate the scheduling effect. They are not a normal-production tok/s prediction.
+The older short HTTP runs are measurements of the previous equal-turn policy, not the long-turn acceptance gate.
+
+**Reuse checkpoints.** Only main SWA and enabled MTP ring allocations are copied into ordinary pageable host RAM.
+The nine global-attention KV caches stay in their existing GPU allocations; captured graphs keep the same addresses.
+A one-head snapshot is 27,197,440 bytes, or 27,877,376 bytes with two heads (layout arithmetic, not transfer timings).
+Per slot, the policy retains prompt milestones at 4K, 8K, 16K, 32K, 64K, 128K and 256K, plus the latest completed
+prompt end, deduplicating coincident entries. The aggregate native 512 MiB budget counts payload, exact-prefix
+metadata, journals and an in-flight replacement; allocation/budget misses preserve a safe fallback. Copies complete
+on the serialized compute owner before a snapshot is published or used. No periodic decode snapshots or cross-slot
+restores are attempted.
+
+A checkpoint boundary C records exact committed tokens `[0,C)`. It replays main token A=C−1 after restoring rings,
+so token A must still match, but old MTP lookahead at C can be replaced. Global KV `[0,A)` must remain intact.
+Every main write beginning at P invalidates checkpoints with A>P **before enqueue**, including identical-token
+rewrites: changing window widths can change numerical KV state. Append and replay at A preserve that checkpoint.
+Reset invalidates its generation. Capture is allowed only at the last successful complete prompt-chunk boundary,
+checked against the decoder's executed-token journal. Restore clears shared hidden ownership, installs the saved
+physical write watermarks, and requires main replay before MTP. Partial CUDA restore failure ends the worker;
+missing or mismatching snapshots never authorize unsafe reuse. Geometric anchors bound memory, not the amount of
+replay for every arbitrary edit.
+
+**Service budget.** Mixed prefill/decode work uses measured compute-owner time: default decode weight 80%, with a
+prefill turn due after 250 ms waiting. Native options are `--decode-service-percent 1..99` and
+`--prefill-max-wait-ms 1..60000`, accepted as separate arguments or `--name=value`. The least normalized service
+total wins, with decode favored on ties and an overdue prefill turn overriding weights. Debt resets when commands
+or phase pairing change. Cancellation is handled first; two decoders or two prefills retain round-robin selection.
+The eight-token competing-prefill cap remains. A deadline includes the currently executing atomic main/MTP unit;
+it is not a fixed streamed-token or first-token latency guarantee. Deadline overrides may lower the achieved share.
+
+**Metrics.** Reserved, versioned `INFO request_diag_v=1` records attach to their command, not process-wide facts;
+ordinary INFO and positional DONE remain compatible. No prompt text or token IDs are logged. Missing diagnostics
+from older tagged engines remain unknown. Per-request history exposes:
+
+- `prefix_reason`, `raw_lcp`, `boundary_keep`, prior `written_end`, selected `resume`, checkpoint boundary/id and reason.
+- `live_written_end`: final physical watermark for affinity estimates, not the prior watermark in prefix diagnostics.
+- `prompt_service_ms`, `decode_service_ms`, phase expert hits/uses and derived service rates/hit rates.
+- Checkpoint capture/restore counts, copy times, payload/metadata bytes and retained boundaries.
+
+Active service covers whole compute-owner units, including sampling/checkpoint work, excluding stdout flush and
+consumer delay. Existing wall decode timings and client-delivered tok/s are unchanged and still include peer work.
+The legacy `hit_rate` is combined prompt/decode routing; compare `decode_hit_rate` with decode-only measurements,
+not the combined value. Reasoning wraps sum durations/counters and recompute ratios; gauges take their final value.
+
+Affinity uses terminal-confirmed processed input plus all native-emitted accepted tokens, including drained output.
+It clears uncertain state on errors/restart and preserves it when cancellation occurred before native preparation.
+Free-slot scoring estimates the better live-ring or matching-anchor boundary. It does not wait indefinitely for a
+busy matching slot, and only native exact-prefix/global-dependency checks can authorize reuse.
+
+**Validation.** `mimo_prefix_checkpoint_test` checks metadata/identity/global-write/budget rules without a GPU.
+`mimo_serve_test` adds bounded-ring restoration and deterministic clock tests for weighted costs, deadline overrides,
+phase accounting and cancellation. The model-required slot test adds ring-aged restore, changed lookahead, branch
+invalidation and peer/reset cases with identical main-window traces and the existing numerical tolerance.
+
+The HTTP smoke tool now defaults to a network-free dry run; add `--run` only for an explicitly selected loaded,
+isolated loopback instance. Existing `--case all` remains the five short checks. Separate `--case long-prefix` and
+`--case matched` campaigns cover 25K/50K/77K/100K rendered prefixes, repeated/assistant/tool/divergent turns and a
+77K decoder beside fresh 28K prefill. They require actual native generation beyond 256 tokens, a length finish,
+request-local diagnostics and bounded suffix replay from the best known matching before-request anchor, not merely
+whichever checkpoint was selected. Valid live-tail continuations are checked separately from aged-ring restores.
+Missing evidence, full-prefix replay, truncated SSE delivery or an early stop cannot pass the reuse gate. Matched results distinguish delivered wall throughput, active
+service, text-update gaps and peer first-text latency; they do not claim a recovered speed without a matched prior
+scheduler baseline. Do not run these campaigns against an occupied service or GPU without approval.
+
+### Long-turn GPU validation (2026-10-16)
+
+GPU 1 on the same RTX PRO 6000 Blackwell Max-Q / Threadripper 9960X / 512 GB Windows 11 PC, one MTP head,
+64 GiB expert budget (5,132 resident experts), mapped CPU experts and a live GPU 0 server sharing CPU/RAM.
+The controlled checkpoint model suite passed graph off, graph on and batched prefill with 1,024-position caches;
+aged-ring restoration/lookahead comparisons reported zero maximum absolute logit error. This is a controlled
+matching-window comparison, not a claim that different GEMM/GEMV window schedules are bitwise identical.
+
+The HTTP campaign used two 262,144-position slots. All six turns at each size completed 512 native output tokens
+with complete SSE/usage evidence: seed, exact repeat, assistant append, normalized tool turn, divergent suffix and
+return to the old branch. The validator checked actual count-endpoint agreement, before-request anchor inventory,
+request/slot identity, and processed-token bounds.
+
+| Seed's actual rendered tokens | Exact repeat: processed / reused | Assistant append: processed | Tool turn: processed |
+| --- | ---: | ---: | ---: |
+| 25,003 | 1 / 25,002 | 20 | 40 |
+| 50,001 | 1 / 50,000 | 20 | 40 |
+| 77,004 | 1 / 77,003 | 20 | 40 |
+| 100,012 | 1 / 100,011 | 20 | 40 |
+
+Observed checkpoint restores took 1.51–3.35 ms. Divergence correctly reused older geometric anchors: 16K, 32K,
+64K and 64K respectively, rather than resurrecting an overwritten later prefix. It still had to process 8,620,
+17,234, 11,469 and 34,477 tokens respectively. Checkpoints do not turn arbitrary edited history into a one-token
+prefill. In the first 25K run, cold seed wall time was 106.18 s and exact-repeat wall time 10.41 s; these include
+512 generated tokens and different warm/adaptive-cache conditions, so this is not an isolated decode speed-up.
+
+Two repetitions per policy compared a warmed 77K decoder with a fresh 28K peer prefill, producing 512 tokens
+per response. The control linked the same decoder libraries and kept checkpoints enabled, replacing only work
+selection with round-robin. Its startup identified `scheduler_policy=round_robin_control` and disabled service
+weighting; the reported configured 80% was ignored. Both campaigns passed the overlap, output and reuse gates.
+
+| Measurement | Service-weighted policy | Round-robin control |
+| --- | ---: | ---: |
+| Median delivered wall rate, solo | 49.2 tok/s | 53.2 tok/s |
+| Median delivered wall rate, competing | 32.4 tok/s | 11.6 tok/s |
+| Competing / solo delivered rate | 66% | 22% |
+| Active decode service / elapsed decode interval, competing | 66–67% | 21–23% |
+| Largest streamed-text update gap per competing response | 0.22–0.30 s | 0.31–0.32 s |
+| Peer first-text latency | 93.1–96.3 s | 104.4–107.1 s |
+
+Delivered wall rate is all 512 output tokens divided by the full API response duration. The competing median was
+2.79 times the control's; solo rates differed by about 8%, and there were only two repetitions per policy.
+The decoder's charged-service rates were 48.6–50.3 tok/s weighted and 51.8–55.5 tok/s round-robin: the delivery
+improvement came from more compute-owner service, not faster decode kernels. The prefill-wait deadline can override
+the 80% weight target, and the peer still progressed. Text-update gaps are not token-by-token latency.
+
+These sequential campaigns used the same GPU, model/profile, expert budget, mapped-expert mode and context settings,
+with the same counted fixture recipe but randomized identifiers (77,007 decoder tokens weighted, 77,006 control).
+This validates the scheduling improvement in this test configuration, not a full old-release before/after comparison,
+a production-speed prediction or a 100 tok/s claim. Each raw artifact keeps `performance_validated=false` because the
+individual campaign does not itself compare policies. Evidence: `build-throughput-cpu/gpu1-matched77k-run2.json`,
+`build-throughput-cpu/gpu1-matched77k-roundrobin-run1.json` and the private control's
+`build-throughput-rr-control/variant.json`; these local build artifacts are not checked into Git.
 
 ### HTTP validation (2026-10-15)
 
@@ -197,11 +321,12 @@ A 47-token request already generating beside a newly arrived 6,228-token prompt 
 | Largest gap between its streamed text chunks | 8.467 s | 0.143 s |
 | Long prompt's first visible text | 21.35 s | 29.74 s |
 
-The interactive policy is retained: protect the live response, accepting slower prompt reading while the two share
-compute. After the peer completes, prefill returns to the configured bulk ceiling. These chunk-gap measurements are
-not a fixed latency guarantee. `tools/mimo/serve_slots_smoke.py --base-url <loopback test server> --case all` repeats
-the streamed/collected, cancellation, long-prompt and queue checks against an already-loaded two-slot instance; it
-never starts/stops a model or changes the launch configuration.
+These runs selected the eight-token interactive cap: protect the live response, accepting slower prompt reading
+while compute is shared. The later service-budget/checkpoint follow-up above is not represented by this table.
+The chunk-gap measurements are not a fixed latency guarantee.
+`tools/mimo/serve_slots_smoke.py --base-url <loopback test server> --case all --run` repeats the streamed/collected,
+cancellation, long-prompt and queue checks against an already-loaded two-slot instance; without `--run` it only
+prints the plan. It never starts/stops a model or changes the launch configuration.
 
 ## Next
 

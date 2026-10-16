@@ -148,10 +148,145 @@ bool MimoDecoder::reset_sequence(int slot, std::string& err) {
     };
     if (!cuda_ok(cudaStreamSynchronize(stream_), "reset boundary", err)) { failed_ = true; return false; }
     Sequence& seq = *sequences_[(size_t) slot];
+    seq.checkpoints.reset();
     for (const auto& kv : seq.kv) if (!clear(kv)) { failed_ = true; return false; }
     if (!clear(seq.mtp_kv) || !clear(seq.mtp2_kv) ||
         !cuda_ok(cudaStreamSynchronize(stream_), "reset sequence", err)) { failed_ = true; return false; }
     hidden_slot_ = mtp_hidden_slot_ = -1;
+    return true;
+}
+
+MimoDecoder::PrefixCheckpointStats MimoDecoder::prefix_checkpoint_stats(int slot) const {
+    if (slot < 0 || slot >= (int) sequences_.size()) return {};
+    return sequences_[(size_t) slot]->checkpoints.stats();
+}
+
+std::vector<int> MimoDecoder::prefix_checkpoint_boundaries(int slot) const {
+    std::vector<int> result;
+    if (slot < 0 || slot >= (int) sequences_.size()) return result;
+    for (const auto& e : sequences_[(size_t) slot]->checkpoints.entries)
+        if (e) result.push_back(e->info.committed_end);
+    std::sort(result.begin(), result.end());
+    return result;
+}
+
+bool MimoDecoder::find_prefix_checkpoint(int slot, const int32_t* target, int n, PrefixCheckpointInfo& out,
+                                         std::string& miss_reason, std::string& err) const {
+    out = {};
+    miss_reason.clear();
+    if (!valid_slot(slot, err)) return false;
+    if (!target || n < 1 || n > cfg_.max_ctx) { err = "checkpoint target out of range"; return false; }
+    const auto& policy = sequences_[(size_t) slot]->checkpoints;
+    if (const auto* e = policy.find(target, n)) { out = e->info; return true; }
+    miss_reason = policy.stats().count ? "prefix_mismatch" : "no_checkpoint";
+    return true;
+}
+
+bool MimoDecoder::capture_prefix_checkpoint(int slot, int committed_end, bool prompt_end, bool& captured,
+                                            std::string& err) {
+    captured = false;
+    if (!valid_slot(slot, err)) return false;
+    auto& seq = *sequences_[(size_t) slot];
+    auto& policy = seq.checkpoints;
+    auto skip = [&](const char* reason) {
+        ++policy.counters.skipped;
+        policy.counters.last_skip_reason = reason;
+        return true;
+    };
+    if (!policy.journal_enabled) return skip("disabled");
+    std::string reason;
+    if (!policy.eligible(committed_end, prompt_end, reason)) return skip("not_needed");
+    if (!next_checkpoint_id_) return skip("disabled");  // never recycle opaque handles on overflow
+    size_t bytes = 0;
+    const auto& g = model_.geometry();
+    for (size_t l = 0; l < seq.kv.size(); ++l)
+        if (g.is_swa((int) l)) bytes += attn_kv_bytes(seq.kv[l].n_kv, seq.kv[l].cap);
+    for (const auto* kv : {&seq.mtp_kv, &seq.mtp2_kv})
+        if (kv->k) bytes += attn_kv_bytes(kv->n_kv, kv->cap);
+    size_t retained = 0;
+    for (const auto& s : sequences_) {
+        const auto usage = s->checkpoints.stats();
+        retained += usage.payload_bytes + usage.metadata_bytes;
+    }
+    using Entry = detail::PrefixCheckpointPolicy::Entry;
+    const size_t minimum_metadata = sizeof(Entry) + (size_t) committed_end * sizeof(int32_t);
+    // Count the old entry AND the in-flight replacement: allocation skips never destroy a working fallback.
+    if (!detail::PrefixCheckpointPolicy::fits_budget(retained, bytes, minimum_metadata)) return skip("budget");
+    std::unique_ptr<Entry> entry;
+    try {
+        entry = std::make_unique<Entry>();
+        entry->prefix.assign(policy.journal.begin(), policy.journal.end());
+        if (!detail::PrefixCheckpointPolicy::fits_budget(retained, bytes, entry->metadata_bytes())) return skip("budget");
+        entry->payload.reset(new unsigned char[bytes]);
+    } catch (const std::bad_alloc&) { return skip("host_allocation"); }
+    entry->info.id = next_checkpoint_id_++;
+    entry->info.committed_end = committed_end;
+    entry->info.replay_pos = committed_end - 1;
+    entry->info.main_written_end = policy.main_written_end;
+    entry->info.mtp_written_end = policy.mtp_written_end;
+    entry->info.mtp2_written_end = policy.mtp2_written_end;
+    entry->info.host_bytes = bytes;
+    entry->info.metadata_bytes = entry->metadata_bytes();
+    entry->milestone = detail::PrefixCheckpointPolicy::milestone(committed_end);
+    entry->prompt_end = prompt_end;
+    const auto start = std::chrono::steady_clock::now();
+    RunGuard guard{failed_};
+    size_t offset = 0;
+    auto copy = [&](const AttnKv& kv) {
+        if (!kv.k) return true;
+        const size_t size = attn_kv_bytes(kv.n_kv, kv.cap);
+        const bool result = cuda_ok(cudaMemcpyAsync(entry->payload.get() + offset, kv.k, size,
+                                                    cudaMemcpyDeviceToHost, stream_), "checkpoint capture", err);
+        offset += size;
+        return result;
+    };
+    bool result = cuda_ok(cudaStreamSynchronize(stream_), "checkpoint capture boundary", err);
+    for (size_t l = 0; result && l < seq.kv.size(); ++l) if (g.is_swa((int) l)) result = copy(seq.kv[l]);
+    if (result) result = copy(seq.mtp_kv) && copy(seq.mtp2_kv);
+    // Drain even a partially enqueued capture before freeing its pageable destination.
+    const bool synced = cuda_ok(cudaStreamSynchronize(stream_), "checkpoint capture completion", err);
+    policy.counters.capture_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    if (!result || !synced) { release_gpu_waits(); return false; }
+    policy.publish(std::move(entry));
+    ++policy.counters.captures;
+    policy.counters.last_skip_reason = "none";
+    captured = guard.complete = true;
+    return true;
+}
+
+bool MimoDecoder::restore_prefix_checkpoint(int slot, uint64_t id, const int32_t* target, int n,
+                                            PrefixCheckpointInfo& restored, std::string& err) {
+    restored = {};
+    if (!valid_slot(slot, err)) return false;
+    if (!target || n < 1 || n > cfg_.max_ctx) { err = "checkpoint target out of range"; return false; }
+    auto& seq = *sequences_[(size_t) slot];
+    auto& policy = seq.checkpoints;
+    const auto* entry = policy.by_id(id);
+    // Revalidate at restore, not just lookup: no GPU operation on unknown/stale/wrong-slot/mismatching handles.
+    if (!entry || !entry->matches(target, n)) { err = "checkpoint unavailable or prefix mismatch"; return false; }
+    const auto start = std::chrono::steady_clock::now();
+    RunGuard guard{failed_};
+    hidden_slot_ = mtp_hidden_slot_ = -1;
+    policy.clear_boundary();
+    size_t offset = 0;
+    auto copy = [&](const AttnKv& kv) {
+        if (!kv.k) return true;
+        const size_t size = attn_kv_bytes(kv.n_kv, kv.cap);
+        const bool result = cuda_ok(cudaMemcpyAsync(kv.k, entry->payload.get() + offset, size,
+                                                    cudaMemcpyHostToDevice, stream_), "checkpoint restore", err);
+        offset += size;
+        return result;
+    };
+    bool result = cuda_ok(cudaStreamSynchronize(stream_), "checkpoint restore boundary", err);
+    const auto& g = model_.geometry();
+    for (size_t l = 0; result && l < seq.kv.size(); ++l) if (g.is_swa((int) l)) result = copy(seq.kv[l]);
+    if (result) result = copy(seq.mtp_kv) && copy(seq.mtp2_kv);
+    const bool synced = cuda_ok(cudaStreamSynchronize(stream_), "checkpoint restore completion", err);
+    policy.counters.restore_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    if (!result || !synced) { release_gpu_waits(); return false; }  // partial restore is fatal, never a cache miss
+    policy.restored(*entry);
+    restored = entry->info;
+    guard.complete = true;
     return true;
 }
 
@@ -197,6 +332,7 @@ bool MimoDecoder::init(std::string& err) {
     for (int slot = 0; slot < cfg_.slots; ++slot) {
         sequences_.push_back(std::make_unique<Sequence>());
         Sequence& seq = *sequences_.back();
+        seq.checkpoints.reserve_journal(cfg_.max_ctx);
         seq.kv.resize((size_t) g.n_layer);
         for (int l = 0; l < g.n_layer; ++l) {
             const bool swa = g.is_swa(l);
@@ -485,6 +621,7 @@ bool MimoDecoder::mtp_draft2(int slot, int32_t d1, int pos, int32_t* d2, std::st
     if (mtp_hidden_slot_ != slot) { err = "MTP hidden state belongs to another slot"; return false; }
     if (!mtp2_arena_) { err = "no second MTP layer loaded"; return false; }
     if (!d2 || d1 < 0 || d1 >= model_.geometry().n_vocab || pos < 0 || pos > cfg_.max_ctx + (int64_t) 1) { err = "second draft out of range"; return false; }
+    sequences_[(size_t) slot]->checkpoints.before_mtp(pos + 1, true, true);
     RunGuard guard{failed_};
     const bool result = [&]() -> bool {
         cudaStream_t s = stream_;
@@ -521,6 +658,7 @@ bool MimoDecoder::mtp_forward(int slot, const int32_t* tokens, int T, int pos0, 
     if (!tokens || !draft || T < 1 || T > kMaxT || pos0 < 0 || pos0 > cfg_.max_ctx - T + 1) { err = "MTP window out of range"; return false; }
     for (int t = 0; t < T; ++t)
         if (tokens[t] < 0 || tokens[t] >= model_.geometry().n_vocab) { err = "MTP token out of range"; return false; }
+    sequences_[(size_t) slot]->checkpoints.before_mtp(pos0 + T, has_mtp2());
     RunGuard guard{failed_};
     const bool result = [&]() -> bool {
         mtp_hidden_slot_ = slot;
@@ -579,6 +717,7 @@ bool MimoDecoder::prompt_chunk(int slot, const int32_t* tokens, int n, int pos0,
         state.slot = slot;
         state.counts.assign((size_t) g.n_layer, std::vector<uint32_t>((size_t) g.n_expert));
     }
+    sequences_[(size_t) slot]->checkpoints.clear_boundary();
     // A failed compute/borrow cannot safely be retried. Also restore the temporary routing-count pointer on throws.
     bool complete = false;
     struct Guard {
@@ -622,6 +761,7 @@ bool MimoDecoder::prompt_chunk(int slot, const int32_t* tokens, int n, int pos0,
     state.tokens += (uint64_t) n;
     state.next_pos = pos0 + n;
     state.finished = final;
+    sequences_[(size_t) slot]->checkpoints.finish_prompt(pos0 + n, final);
     hidden_slot_ = slot;
     mtp_hidden_slot_ = has_mtp2() ? slot : -1;
     complete = true;
@@ -960,6 +1100,8 @@ bool MimoDecoder::forward(int slot, const int32_t* tokens, int T, int pos0, int3
     }
     for (int t = 0; t < T; ++t)
         if (tokens[t] < 0 || tokens[t] >= g.n_vocab) { err = "token out of range"; return false; }
+    auto& checkpoint_policy = sequences_[(size_t) slot]->checkpoints;
+    checkpoint_policy.before_main(pos0, T);
     RunGuard guard{failed_};
     const bool result = [&]() -> bool {
         hidden_slot_ = slot;
@@ -1099,6 +1241,7 @@ bool MimoDecoder::forward(int slot, const int32_t* tokens, int T, int pos0, int3
         usage_tokens_ += (uint64_t) T;
         return true;
     }();
+    if (result) checkpoint_policy.after_main(tokens, pos0, T);
     guard.complete = result;
     if (!result) release_gpu_waits();
     return result;
